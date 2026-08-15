@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adapt H3 Workflow"
+  short_description: "Adapt custom MiniMax H3 ComfyUI workflows"
+  default_prompt: "Use $adapt-h3-workflow to add or update a MiniMax H3 workflow adapter for this middleware."

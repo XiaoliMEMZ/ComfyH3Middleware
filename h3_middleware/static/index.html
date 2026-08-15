@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>H3 Gateway Console</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="login-layer" id="login-layer" hidden>
+    <form class="login-panel" id="login-form">
+      <div class="brand-mark" aria-hidden="true">H3</div>
+      <h1>Gateway Console</h1>
+      <label for="admin-token">管理员令牌</label>
+      <input id="admin-token" name="token" type="password" autocomplete="current-password" required autofocus>
+      <button class="button primary full" type="submit">登录</button>
+      <p class="form-error" id="login-error" role="alert"></p>
+    </form>
+  </div>
+
+  <div class="shell" id="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">H3</div>
+        <div>
+          <strong>Gateway</strong>
+          <span>Control plane</span>
+        </div>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item active" data-view="overview">概览</button>
+        <button class="nav-item" data-view="jobs">任务</button>
+        <button class="nav-item" data-view="queue">队列</button>
+        <button class="nav-item" data-view="upstreams">上游</button>
+        <button class="nav-item" data-view="keys">API Keys</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="health-line"><i id="global-health-dot"></i><span id="global-health-text">检查中</span></span>
+        <button class="button ghost" id="logout-button" type="button">退出</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">概览</h1>
+          <p id="page-subtitle">集群状态与近期任务</p>
+        </div>
+        <div class="topbar-actions">
+          <span class="updated" id="last-updated"></span>
+          <button class="icon-button" id="refresh-button" type="button" title="刷新" aria-label="刷新">&#8635;</button>
+          <button class="button mobile-logout" id="mobile-logout-button" type="button">退出</button>
+        </div>
+      </header>
+
+      <section class="view active" id="view-overview" aria-labelledby="page-title">
+        <div class="metric-grid" id="metric-grid">
+          <article class="metric"><span>运行中</span><strong id="metric-running">0</strong><small>submitted + running</small></article>
+          <article class="metric"><span>本地排队</span><strong id="metric-queued">0</strong><small id="metric-queue-state">正常分发</small></article>
+          <article class="metric"><span>今日任务</span><strong id="metric-day">0</strong><small>最近 24 小时</small></article>
+          <article class="metric"><span>健康上游</span><strong id="metric-upstreams">0 / 0</strong><small id="metric-busy">0 个忙碌</small></article>
+        </div>
+
+        <div class="overview-grid">
+          <section class="panel-section">
+            <div class="section-head">
+              <div><h2>上游状态</h2><p>实时队列与健康检查</p></div>
+              <button class="button" data-go="upstreams" type="button">管理上游</button>
+            </div>
+            <div class="upstream-strip" id="overview-upstreams"></div>
+          </section>
+          <section class="panel-section">
+            <div class="section-head"><div><h2>最近事件</h2><p>调度与管理操作</p></div></div>
+            <ol class="event-list" id="event-list"></ol>
+          </section>
+        </div>
+
+        <section class="panel-section">
+          <div class="section-head">
+            <div><h2>最近任务</h2><p>按提交时间倒序</p></div>
+            <button class="button" data-go="jobs" type="button">查看全部</button>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>任务</th><th>模式</th><th>状态</th><th>上游</th><th>创建时间</th></tr></thead><tbody id="recent-jobs-body"></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="view" id="view-jobs">
+        <div class="toolbar">
+          <div class="filters">
+            <input id="job-search" type="search" placeholder="搜索任务 ID 或提示词">
+            <select id="job-status-filter" aria-label="状态筛选">
+              <option value="">全部状态</option>
+              <option value="queued">queued</option><option value="retrying">retrying</option>
+              <option value="submitted">submitted</option><option value="running">running</option>
+              <option value="succeeded">succeeded</option><option value="failed">failed</option>
+              <option value="canceled">canceled</option><option value="upstream_unreachable">upstream_unreachable</option>
+            </select>
+            <select id="job-mode-filter" aria-label="模式筛选">
+              <option value="">全部模式</option><option value="t2va">T2VA</option>
+              <option value="i2va">I2VA</option><option value="fl2va">FL2VA</option><option value="ref2va">Ref2VA</option>
+            </select>
+          </div>
+          <span class="record-count" id="job-count">0 条任务</span>
+        </div>
+        <div class="table-wrap table-main">
+          <table>
+            <thead><tr><th>任务</th><th>模式</th><th>状态</th><th>优先级</th><th>上游</th><th>耗时</th><th>创建时间</th><th class="actions-col">操作</th></tr></thead>
+            <tbody id="jobs-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="view" id="view-queue">
+        <div class="queue-banner" id="queue-banner">
+          <div><strong id="queue-state-title">队列运行中</strong><span id="queue-state-copy">新任务会按优先级自动分发</span></div>
+          <button class="button warning" id="queue-toggle" type="button">暂停分发</button>
+        </div>
+        <div class="section-head queue-head"><div><h2>中间件队列</h2><p id="queue-count">0 个待分发任务</p></div></div>
+        <div class="queue-list" id="queue-list"></div>
+      </section>
+
+      <section class="view" id="view-upstreams">
+        <div class="toolbar">
+          <div><strong class="toolbar-title">ComfyUI 上游</strong><span class="toolbar-copy">调度容量、权重与适配器</span></div>
+          <button class="button primary" id="add-upstream" type="button">添加上游</button>
+        </div>
+        <div class="upstream-list" id="upstream-list"></div>
+      </section>
+
+      <section class="view" id="view-keys">
+        <div class="toolbar">
+          <div><strong class="toolbar-title">API Keys</strong><span class="toolbar-copy">调用凭证只在创建时显示一次</span></div>
+          <button class="button primary" id="add-key" type="button">创建 Key</button>
+        </div>
+        <div class="table-wrap table-main">
+          <table>
+            <thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>过期时间</th><th class="actions-col">操作</th></tr></thead>
+            <tbody id="keys-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="upstream-dialog">
+    <form method="dialog" id="upstream-form" class="dialog-form">
+      <div class="dialog-head"><h2 id="upstream-dialog-title">添加上游</h2><button class="icon-button" data-close="upstream-dialog" type="button" aria-label="关闭">&#215;</button></div>
+      <input type="hidden" id="upstream-id">
+      <div class="form-grid">
+        <label>名称<input id="upstream-name" required></label>
+        <label>Base URL<input id="upstream-url" type="url" placeholder="http://127.0.0.1:8188" required></label>
+        <label>权重<input id="upstream-weight" type="number" min="0.01" step="0.01" value="1" required></label>
+        <label>最大并发<input id="upstream-concurrency" type="number" min="1" step="1" value="1" required></label>
+        <label>适配器<select id="upstream-adapter"><option value="minimax-h3-native">minimax-h3-native</option></select></label>
+        <label>Bearer Token<input id="upstream-token" type="password" autocomplete="new-password" placeholder="留空表示不修改"></label>
+        <label class="wide">条件节点<input id="upstream-conditioning" placeholder="MiniMaxH3ImageToVideo"></label>
+        <label class="check-row wide"><input id="upstream-enabled" type="checkbox" checked><span>启用调度</span></label>
+      </div>
+      <p class="form-error" id="upstream-error"></p>
+      <div class="dialog-actions"><button class="button" data-close="upstream-dialog" type="button">取消</button><button class="button primary" id="save-upstream" type="button">保存</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="key-dialog">
+    <form method="dialog" id="key-form" class="dialog-form">
+      <div class="dialog-head"><h2>创建 API Key</h2><button class="icon-button" data-close="key-dialog" type="button" aria-label="关闭">&#215;</button></div>
+      <label>名称<input id="key-name" required placeholder="Production client"></label>
+      <label>过期时间<input id="key-expiry" type="datetime-local"></label>
+      <p class="form-error" id="key-error"></p>
+      <div class="dialog-actions"><button class="button" data-close="key-dialog" type="button">取消</button><button class="button primary" id="save-key" type="button">创建</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="token-dialog">
+    <div class="dialog-form">
+      <div class="dialog-head"><h2>API Key 已创建</h2><button class="icon-button" data-close="token-dialog" type="button" aria-label="关闭">&#215;</button></div>
+      <p class="token-warning">关闭后无法再次查看完整凭证。</p>
+      <div class="token-box"><code id="new-token"></code><button class="button" id="copy-token" type="button">复制</button></div>
+      <div class="dialog-actions"><button class="button primary" data-close="token-dialog" type="button">完成</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="detail-dialog" class="detail-dialog">
+    <div class="dialog-form">
+      <div class="dialog-head"><h2>任务详情</h2><button class="icon-button" data-close="detail-dialog" type="button" aria-label="关闭">&#215;</button></div>
+      <pre id="job-detail"></pre>
+    </div>
+  </dialog>
+
+  <dialog id="upstream-ops-dialog" class="detail-dialog">
+    <div class="dialog-form">
+      <div class="dialog-head"><h2 id="upstream-ops-title">上游原子操作</h2><button class="icon-button" data-close="upstream-ops-dialog" type="button" aria-label="关闭">&#215;</button></div>
+      <div class="atomic-actions">
+        <button class="button" data-atomic-action="refresh" type="button">刷新状态</button>
+        <button class="button warning" data-atomic-action="interrupt" type="button">全局中断</button>
+        <button class="button danger" data-atomic-action="clear-queue" type="button">清空等待</button>
+        <button class="button danger" data-atomic-action="clear-history" type="button">清空历史</button>
+        <button class="button" data-atomic-action="free" type="button">释放模型</button>
+      </div>
+      <pre id="upstream-ops-output">正在读取...</pre>
+    </div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

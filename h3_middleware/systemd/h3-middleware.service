@@ -1,0 +1,15 @@
+[Unit]
+Description=MiniMax H3 ComfyUI middleware gateway
+After=network.target comfyui.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ComfyUI
+EnvironmentFile=-/etc/h3-middleware.env
+ExecStart=/root/ComfyUI/.venv/bin/python -m h3_middleware
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
