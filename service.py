@@ -21,6 +21,7 @@ from .comfy_client import (
 )
 from .config import Settings
 from .database import ACTIVE_STATUSES, LOCAL_QUEUE_STATUSES, TERMINAL_STATUSES, Database
+from .progress import apply_progress_event, create_progress, event_prompt_id, present_progress
 from .upstreams import UpstreamManager
 from .workflows import AdapterRegistry, create_registry
 
@@ -37,10 +38,13 @@ class GatewayService:
         self.session: aiohttp.ClientSession | None = None
         self.upstreams: UpstreamManager | None = None
         self.tasks: list[asyncio.Task[Any]] = []
+        self.progress_listeners: dict[str, asyncio.Task[Any]] = {}
+        self.progress_listener_configs: dict[str, tuple[str, str | None]] = {}
         self.wake_scheduler = asyncio.Event()
         self.stopping = False
 
     async def start(self) -> None:
+        self.stopping = False
         self.settings.prepare()
         await self.database.initialize()
         await self.database.seed_upstreams(self.settings.initial_upstreams)
@@ -52,7 +56,9 @@ class GatewayService:
         self.session = aiohttp.ClientSession(timeout=timeout)
         self.upstreams = UpstreamManager(self.database, self.session, self.settings.capability_interval)
         await self.upstreams.health_check_all(force_capabilities=True)
+        await self._sync_progress_listeners()
         self.tasks = [
+            asyncio.create_task(self._progress_supervisor_loop(), name="h3-progress-supervisor"),
             asyncio.create_task(self._scheduler_loop(), name="h3-scheduler"),
             asyncio.create_task(self._monitor_loop(), name="h3-monitor"),
             asyncio.create_task(self._health_loop(), name="h3-health"),
@@ -66,6 +72,13 @@ class GatewayService:
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks.clear()
+        listeners = list(self.progress_listeners.values())
+        for task in listeners:
+            task.cancel()
+        if listeners:
+            await asyncio.gather(*listeners, return_exceptions=True)
+        self.progress_listeners.clear()
+        self.progress_listener_configs.clear()
         if self.session is not None:
             await self.session.close()
             self.session = None
@@ -119,6 +132,7 @@ class GatewayService:
 
     def public_job(self, job: dict[str, Any]) -> dict[str, Any]:
         item = dict(job)
+        item["progress"] = present_progress(item.get("progress"), item["status"], item.get("updated_at"))
         stored_assets = item.pop("assets", {})
         item["inputs"] = {
             kind: [
@@ -520,6 +534,7 @@ class GatewayService:
                 )
                 await self.database.add_event("job.failed", "job", job["id"], str(exc), {"stage": "workflow"})
                 return
+            await self.database.update_job(job["id"], progress=create_progress(prompt))
             latest = await self.database.get_job(job["id"])
             if not latest or latest["cancel_requested"]:
                 await self.database.update_job(job["id"], status="canceled", finished_at=time.time())
@@ -552,9 +567,11 @@ class GatewayService:
                     continue
 
             prompt_id = str(response.get("prompt_id") or dispatch_prompt_id)
+            latest = await self.database.get_job(job["id"])
+            status = latest["status"] if latest and latest["status"] in {"running", "canceling"} else "submitted"
             await self.database.update_job(
                 job["id"],
-                status="submitted",
+                status=status,
                 upstream_id=upstream["id"],
                 prompt_id=prompt_id,
                 error=None,
@@ -713,6 +730,92 @@ class GatewayService:
                     {"message": f"prompt disappeared from {upstream['name']} before producing history", "stage": "monitor"},
                 )
 
+    async def _progress_supervisor_loop(self) -> None:
+        while not self.stopping:
+            try:
+                await self._sync_progress_listeners()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("progress listener supervisor failed")
+            await asyncio.sleep(max(1.0, self.settings.poll_interval))
+
+    async def _sync_progress_listeners(self) -> None:
+        upstreams = await self.database.list_upstreams()
+        wanted = {upstream["id"]: upstream for upstream in upstreams}
+        stale: list[asyncio.Task[Any]] = []
+        for upstream_id, task in list(self.progress_listeners.items()):
+            upstream = wanted.get(upstream_id)
+            signature = (upstream["base_url"], upstream.get("auth_token")) if upstream else None
+            if signature != self.progress_listener_configs.get(upstream_id) or task.done():
+                task.cancel()
+                stale.append(task)
+                self.progress_listeners.pop(upstream_id, None)
+                self.progress_listener_configs.pop(upstream_id, None)
+        if stale:
+            await asyncio.gather(*stale, return_exceptions=True)
+
+        for upstream_id, upstream in wanted.items():
+            if upstream_id in self.progress_listeners:
+                continue
+            self.progress_listener_configs[upstream_id] = (upstream["base_url"], upstream.get("auth_token"))
+            self.progress_listeners[upstream_id] = asyncio.create_task(
+                self._progress_listener_loop(upstream),
+                name=f"h3-progress-{upstream_id}",
+            )
+
+    async def _progress_listener_loop(self, upstream: dict[str, Any]) -> None:
+        retry_delay = 1.0
+        while not self.stopping:
+            try:
+                async for event in self._client(upstream).events():
+                    retry_delay = 1.0
+                    await self._handle_progress_event(upstream, event)
+                if self.stopping:
+                    return
+                raise ComfyError("ComfyUI WebSocket closed", transport=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if retry_delay == 1.0:
+                    LOGGER.warning("Progress WebSocket for %s is unavailable: %s", upstream["name"], exc)
+                else:
+                    LOGGER.debug("Progress WebSocket retry for %s failed: %s", upstream["name"], exc)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(30.0, retry_delay * 2)
+
+    async def _handle_progress_event(self, upstream: dict[str, Any], event: dict[str, Any]) -> None:
+        prompt_id = event_prompt_id(event)
+        if prompt_id is None:
+            active = [
+                job
+                for job in await self.database.active_jobs()
+                if job.get("upstream_id") == upstream["id"] and job.get("prompt_id")
+            ]
+            running = [job for job in active if job["status"] == "running"]
+            candidates = running if len(running) == 1 else active
+            if len(candidates) != 1:
+                return
+            prompt_id = candidates[0]["prompt_id"]
+
+        job = await self.database.get_job_by_prompt_id(prompt_id)
+        if not job or job["status"] in TERMINAL_STATUSES:
+            return
+        if job.get("upstream_id") and job["upstream_id"] != upstream["id"]:
+            return
+        progress = apply_progress_event(job.get("progress"), event)
+        if progress is None:
+            return
+
+        values: dict[str, Any] = {
+            "progress": progress,
+            "upstream_id": upstream["id"],
+        }
+        if job["status"] != "canceling":
+            values["status"] = "running"
+            values["started_at"] = job.get("started_at") or time.time()
+        await self.database.update_job(job["id"], **values)
+
     async def _health_loop(self) -> None:
         while not self.stopping:
             try:
@@ -762,4 +865,10 @@ class GatewayService:
             "adapters": [adapter.schema() for adapter in self.registry.list()],
             "queue_actions": ["front", "back", "before", "after"],
             "job_statuses": [*LOCAL_QUEUE_STATUSES, *ACTIVE_STATUSES, *TERMINAL_STATUSES],
+            "progress": {
+                "endpoint": "/v1/jobs/{job_id}/progress",
+                "phase_examples": ["dit_sampling", "vae_decoding", "video_encoding"],
+                "eta_scope": "current_node",
+                "workflow_percent_method": "node_weighted",
+            },
         }

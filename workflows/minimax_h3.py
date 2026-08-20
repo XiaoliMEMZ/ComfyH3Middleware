@@ -50,7 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "fl2va_unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
     "ref2va_unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     "weight_dtype": "default",
-    "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+    "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
     "clip_type": "minimax",
     "clip_device": "default",
     "filename_prefix": None,

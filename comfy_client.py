@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import quote
 
 import aiohttp
@@ -21,10 +22,12 @@ class ComfyClient:
         session: aiohttp.ClientSession,
         base_url: str,
         auth_token: str | None = None,
+        client_id: str = "h3-middleware",
     ) -> None:
         self.session = session
         self.base_url = base_url.rstrip("/")
         self.headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        self.client_id = client_id
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
         headers = dict(self.headers)
@@ -88,6 +91,35 @@ class ComfyClient:
         history = value.get(prompt_id)
         return history if isinstance(history, dict) else None
 
+    async def events(self) -> AsyncIterator[dict[str, Any]]:
+        try:
+            async with self.session.ws_connect(
+                f"{self.base_url}/ws",
+                params={"clientId": self.client_id},
+                headers=self.headers,
+                heartbeat=20,
+            ) as websocket:
+                await websocket.send_json(
+                    {"type": "feature_flags", "data": {"supports_preview_metadata": False}}
+                )
+                async for message in websocket:
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            value = json.loads(message.data)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(value, dict):
+                            yield value
+                    elif message.type == aiohttp.WSMsgType.ERROR:
+                        raise ComfyError(
+                            f"ComfyUI WebSocket failed: {websocket.exception()}",
+                            transport=True,
+                        )
+                    elif message.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}:
+                        break
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise ComfyError(f"ComfyUI WebSocket connection failed: {exc}", transport=True) from exc
+
     async def upload_asset(self, asset: dict[str, Any], subfolder: str) -> str:
         path = Path(asset["path"])
         form = aiohttp.FormData()
@@ -116,7 +148,7 @@ class ComfyClient:
         payload = {
             "prompt": prompt,
             "prompt_id": prompt_id,
-            "client_id": "h3-middleware",
+            "client_id": self.client_id,
             "extra_data": extra_data or {},
         }
         value = await self.request("POST", "/prompt", json=payload)

@@ -45,7 +45,7 @@ class Settings:
         )
         return cls(
             host=os.environ.get("H3_HOST", "0.0.0.0"),
-            port=int(os.environ.get("H3_PORT", "8193")),
+            port=int(os.environ.get("H3_PORT", "8191")),
             data_dir=data_dir,
             database_path=Path(os.environ.get("H3_DATABASE", data_dir / "gateway.sqlite3")).resolve(),
             asset_dir=Path(os.environ.get("H3_ASSET_DIR", data_dir / "assets")).resolve(),

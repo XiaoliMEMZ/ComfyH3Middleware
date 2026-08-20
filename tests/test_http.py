@@ -75,6 +75,63 @@ class HttpApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(await response.read(), b"video-data")
 
+    async def test_progress_endpoint_reports_comfy_node_steps(self) -> None:
+        self.fake.complete_after = 1000
+        headers = {"Authorization": "Bearer api"}
+        response = await self.client.post(
+            "/v1/generations",
+            json={"prompt": "clouds", "steps": 20},
+            headers=headers,
+        )
+        self.assertEqual(response.status, 202)
+        job_id = (await response.json())["job_id"]
+
+        deadline = asyncio.get_running_loop().time() + 3
+        prompt_id = None
+        while prompt_id is None:
+            response = await self.client.get(f"/v1/jobs/{job_id}", headers=headers)
+            prompt_id = (await response.json())["job"].get("prompt_id")
+            if asyncio.get_running_loop().time() >= deadline:
+                self.fail("job was not submitted to fake ComfyUI")
+            if prompt_id is None:
+                await asyncio.sleep(0.02)
+
+        await self.fake.emit(
+            prompt_id,
+            "progress_state",
+            {
+                "nodes": {
+                    "10": {
+                        "node_id": "10",
+                        "state": "running",
+                        "value": 6,
+                        "max": 20,
+                    }
+                }
+            },
+        )
+
+        while True:
+            response = await self.client.get(f"/v1/jobs/{job_id}/progress", headers=headers)
+            payload = await response.json()
+            progress = payload["progress"]
+            if (progress.get("step") or {}).get("value") == 6:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                self.fail("progress endpoint did not receive the ComfyUI event")
+            await asyncio.sleep(0.02)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(progress["source"], "comfy_websocket")
+        self.assertEqual(progress["phase"], "dit_sampling")
+        self.assertEqual(progress["node"]["type"], "SamplerCustomAdvanced")
+        self.assertEqual(progress["step"], {"value": 6, "max": 20, "percent": 30.0})
+
+        response = await self.client.get(f"/v1/jobs/{job_id}", headers=headers)
+        job = (await response.json())["job"]
+        self.assertEqual(job["progress"]["step"]["value"], 6)
+
     async def test_multipart_legacy_i2va_and_missing_image(self) -> None:
         headers = {"Authorization": "Bearer api"}
         response = await self.client.post("/v1/i2va", data={"prompt": "move"}, headers=headers)

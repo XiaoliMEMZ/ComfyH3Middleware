@@ -1,5 +1,6 @@
 [Unit]
 Description=MiniMax H3 ComfyUI middleware gateway
+Wants=comfyui.service
 After=network.target comfyui.service
 
 [Service]

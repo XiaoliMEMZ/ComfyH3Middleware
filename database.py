@@ -20,6 +20,7 @@ JOB_JSON_COLUMNS = {
     "assets_json": "assets",
     "outputs_json": "outputs",
     "error_json": "error",
+    "progress_json": "progress",
 }
 UPSTREAM_JSON_COLUMNS = {
     "options_json": "options",
@@ -103,6 +104,7 @@ class Database:
                 assets_json TEXT NOT NULL,
                 outputs_json TEXT NOT NULL DEFAULT '[]',
                 error_json TEXT,
+                progress_json TEXT NOT NULL DEFAULT '{}',
                 upstream_id TEXT,
                 prompt_id TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -141,6 +143,9 @@ class Database:
             );
             """
         )
+        job_columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+        if "progress_json" not in job_columns:
+            connection.execute("ALTER TABLE jobs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'")
         connection.execute(
             "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES('queue_paused', 'false', ?)",
             (now(),),
@@ -412,6 +417,11 @@ class Database:
             row = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return self._job(row) if row else None
 
+    async def get_job_by_prompt_id(self, prompt_id: str) -> dict[str, Any] | None:
+        async with self.lock:
+            row = self.conn.execute("SELECT * FROM jobs WHERE prompt_id=?", (prompt_id,)).fetchone()
+        return self._job(row) if row else None
+
     async def list_jobs(
         self,
         *,
@@ -510,6 +520,7 @@ class Database:
             "assets",
             "outputs",
             "error",
+            "progress",
             "upstream_id",
             "prompt_id",
             "attempts",
@@ -647,7 +658,7 @@ class Database:
             self.conn.execute(
                 """
                 UPDATE jobs SET status='queued', queue_order=?, upstream_id=NULL, prompt_id=NULL,
-                    attempts=0, not_before=0, cancel_requested=0, outputs_json='[]', error_json=NULL,
+                    attempts=0, not_before=0, cancel_requested=0, outputs_json='[]', error_json=NULL, progress_json='{}',
                     submitted_at=NULL, started_at=NULL, finished_at=NULL, updated_at=?
                 WHERE id=?
                 """,
@@ -742,7 +753,7 @@ class Database:
     def _job(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         for column, key in JOB_JSON_COLUMNS.items():
-            default: Any = [] if key == "outputs" else {} if key in {"params", "assets"} else None
+            default: Any = [] if key == "outputs" else {} if key in {"params", "assets", "progress"} else None
             item[key] = _decode_json(item.pop(column), default)
         item["cancel_requested"] = bool(item["cancel_requested"])
         return item

@@ -26,6 +26,7 @@ class MiniMaxH3AdapterTests(unittest.TestCase):
         self.assertEqual(params["length"], 124)
         graph = self.adapter.build(params, {})
         self.assertEqual(graph["20"]["class_type"], "MiniMaxH3ImageToVideo")
+        self.assertEqual(graph["5"]["inputs"]["clip_name"], "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors")
         self.assertNotIn("first_frame", graph["20"]["inputs"])
         self.assertEqual(graph["20"]["inputs"]["width"], 1344)
         self.assertEqual(graph["8"]["inputs"]["noise_seed"], 7)

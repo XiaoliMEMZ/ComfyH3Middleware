@@ -65,6 +65,33 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered["status"], "queued")
         self.assertIsNone(recovered["upstream_id"])
 
+    async def test_progress_is_persistent(self) -> None:
+        await self.create_job("job-a")
+        progress = {
+            "phase": "dit_sampling",
+            "step": {"value": 4, "max": 20, "percent": 20.0},
+        }
+        await self.database.update_job("job-a", progress=progress)
+        await self.database.close()
+
+        self.database = Database(Path(self.tempdir.name) / "test.sqlite3")
+        await self.database.initialize()
+        job = await self.database.get_job("job-a")
+        self.assertEqual(job["progress"], progress)
+
+    async def test_existing_database_gets_progress_column(self) -> None:
+        await self.create_job("job-a")
+        async with self.database.lock:
+            self.database.conn.execute("ALTER TABLE jobs DROP COLUMN progress_json")
+            self.database.conn.commit()
+        await self.database.close()
+
+        self.database = Database(Path(self.tempdir.name) / "test.sqlite3")
+        await self.database.initialize()
+        columns = {row["name"] for row in self.database.conn.execute("PRAGMA table_info(jobs)")}
+        self.assertIn("progress_json", columns)
+        self.assertEqual((await self.database.get_job("job-a"))["progress"], {})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -169,6 +169,21 @@ async def get_job(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "job": job})
 
 
+@routes.get("/v1/jobs/{job_id}/progress")
+async def get_job_progress(request: web.Request) -> web.Response:
+    job = await service(request).get_job(request.match_info["job_id"])
+    if not job or not can_access(request, job):
+        return json_error("Job not found", status=404)
+    return web.json_response(
+        {
+            "ok": True,
+            "job_id": job["id"],
+            "status": job["status"],
+            "progress": job["progress"],
+        }
+    )
+
+
 @routes.post("/v1/jobs/{job_id}/cancel")
 async def cancel_job(request: web.Request) -> web.Response:
     gateway = service(request)

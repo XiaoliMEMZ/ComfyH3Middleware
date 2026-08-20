@@ -38,7 +38,12 @@ class UpstreamManager:
         self._lock = asyncio.Lock()
 
     def client(self, upstream: dict[str, Any]) -> ComfyClient:
-        return ComfyClient(self.session, upstream["base_url"], upstream.get("auth_token"))
+        return ComfyClient(
+            self.session,
+            upstream["base_url"],
+            upstream.get("auth_token"),
+            client_id=f"h3-middleware-{upstream['id']}",
+        )
 
     async def health_check_all(self, force_capabilities: bool = False) -> list[dict[str, Any]]:
         upstreams = await self.database.list_upstreams(enabled_only=True)

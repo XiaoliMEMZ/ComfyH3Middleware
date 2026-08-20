@@ -31,12 +31,15 @@ class FakeComfy:
         self.uploads = 0
         self.global_interrupts = 0
         self.history_cleared = False
+        self.sockets: dict[str, web.WebSocketResponse] = {}
+        self.prompt_clients: dict[str, str] = {}
         self.runner: web.AppRunner | None = None
         self.base_url = ""
 
     async def start(self) -> None:
         app = web.Application()
         app.router.add_get("/system_stats", self.system_stats)
+        app.router.add_get("/ws", self.websocket)
         app.router.add_get("/object_info", self.object_info)
         app.router.add_get("/queue", self.queue)
         app.router.add_get("/prompt", self.prompt_status)
@@ -65,6 +68,20 @@ class FakeComfy:
     async def system_stats(self, request: web.Request) -> web.Response:
         return web.json_response({"system": {"comfyui_version": "test"}, "devices": []})
 
+    async def websocket(self, request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+        client_id = request.query.get("clientId") or "anonymous"
+        self.sockets[client_id] = websocket
+        await websocket.send_json({"type": "status", "data": {"status": {"exec_info": {"queue_remaining": 0}}}})
+        try:
+            async for _ in websocket:
+                pass
+        finally:
+            if self.sockets.get(client_id) is websocket:
+                self.sockets.pop(client_id, None)
+        return websocket
+
     async def object_info(self, request: web.Request) -> web.Response:
         adapter = MiniMaxH3Adapter()
         nodes = set()
@@ -90,7 +107,19 @@ class FakeComfy:
             return web.json_response({"error": {"message": "rejected"}, "node_errors": {}}, status=503)
         prompt_id = body["prompt_id"]
         self.prompts[prompt_id] = body["prompt"]
+        self.prompt_clients[prompt_id] = body["client_id"]
         return web.json_response({"prompt_id": prompt_id, "number": len(self.prompts), "node_errors": {}})
+
+    async def emit(self, prompt_id: str, event_type: str, data: dict[str, Any]) -> None:
+        client_id = self.prompt_clients[prompt_id]
+        deadline = asyncio.get_running_loop().time() + 2
+        while client_id not in self.sockets or self.sockets[client_id].closed:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(f"WebSocket client {client_id} did not connect")
+            await asyncio.sleep(0.01)
+        await self.sockets[client_id].send_json(
+            {"type": event_type, "data": {"prompt_id": prompt_id, **data}}
+        )
 
     async def upload(self, request: web.Request) -> web.Response:
         self.uploads += 1
@@ -194,6 +223,16 @@ async def wait_status(service: GatewayService, job_id: str, statuses: set[str], 
     raise AssertionError(f"job {job_id} did not reach {statuses}")
 
 
+async def wait_progress(service: GatewayService, job_id: str, predicate, timeout: float = 3) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        job = await service.get_job(job_id)
+        if job and predicate(job["progress"]):
+            return job["progress"]
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not report expected progress")
+
+
 class GatewayServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -232,6 +271,63 @@ class GatewayServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data, b"video-data")
         self.assertEqual(content_type, "video/mp4")
         self.assertTrue(filename.endswith(".mp4"))
+
+    async def test_websocket_reports_node_step_phase_and_eta(self) -> None:
+        upstream = await self.fake(complete_after=1000)
+        self.service = GatewayService(settings(Path(self.tempdir.name), (upstream.base_url,)))
+        await self.service.start()
+        job_id = "11111111-1111-4111-8111-111111111112"
+        await self.service.submit(job_id, {"prompt": "clouds", "steps": 20}, {}, "test")
+        job = await wait_status(self.service, job_id, {"submitted", "running"})
+        prompt_id = job["prompt_id"]
+        self.assertTrue(upstream.prompt_clients[prompt_id].startswith("h3-middleware-"))
+
+        await upstream.emit(
+            prompt_id,
+            "progress_state",
+            {
+                "nodes": {
+                    "10": {
+                        "node_id": "10",
+                        "prompt_id": prompt_id,
+                        "state": "running",
+                        "value": 4,
+                        "max": 20,
+                    }
+                }
+            },
+        )
+        progress = await wait_progress(self.service, job_id, lambda value: (value.get("step") or {}).get("value") == 4)
+        self.assertEqual(progress["source"], "comfy_websocket")
+        self.assertEqual(progress["phase"], "dit_sampling")
+        self.assertEqual(progress["node"]["type"], "SamplerCustomAdvanced")
+        self.assertEqual(progress["step"], {"value": 4, "max": 20, "percent": 20.0})
+        self.assertGreater(progress["workflow"]["total_nodes"], 10)
+
+        await asyncio.sleep(0.05)
+        await upstream.emit(
+            prompt_id,
+            "progress_state",
+            {
+                "nodes": {
+                    "10": {
+                        "node_id": "10",
+                        "prompt_id": prompt_id,
+                        "state": "running",
+                        "value": 8,
+                        "max": 20,
+                    }
+                }
+            },
+        )
+        progress = await wait_progress(self.service, job_id, lambda value: (value.get("step") or {}).get("value") == 8)
+        self.assertGreater(progress["eta_seconds"], 0)
+        self.assertEqual(progress["eta_scope"], "current_node")
+
+        await upstream.emit(prompt_id, "executing", {"node": "11", "display_node": "11"})
+        progress = await wait_progress(self.service, job_id, lambda value: (value.get("node") or {}).get("id") == "11")
+        self.assertEqual(progress["phase"], "vae_decoding")
+        self.assertEqual(progress["node"]["type"], "VAEDecode")
 
     async def test_dispatch_fails_over_to_second_upstream(self) -> None:
         rejected = await self.fake(reject_prompts=True)

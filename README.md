@@ -2,7 +2,7 @@
 
 面向 MiniMax H3 本地推理的 ComfyUI 中间层。它是 `i2va_middleware/` 的独立重写，旧目录和旧服务不会被修改。
 
-新服务默认监听 `8193`，提供四种原生 H3 生成模式、持久化任务队列、多 ComfyUI 调度与故障转移、任务原子取消、API Key 管理和运维后台。
+新服务默认监听 `8191`，提供四种原生 H3 生成模式、持久化任务队列、多 ComfyUI 调度与故障转移、任务原子取消、API Key 管理和运维后台。
 
 ## 结构
 
@@ -49,9 +49,9 @@ export H3_UPSTREAMS='http://127.0.0.1:8188,http://127.0.0.1:8189'
 
 服务地址：
 
-- API：`http://127.0.0.1:8193/v1/schema`
-- 管理后台：`http://127.0.0.1:8193/admin`
-- 健康检查：`http://127.0.0.1:8193/health`
+- API：`http://127.0.0.1:8191/v1/schema`
+- 管理后台：`http://127.0.0.1:8191/admin`
+- 健康检查：`http://127.0.0.1:8191/health`
 
 未设置环境变量时会使用仅供本机开发的 `h3-admin-change-me` 和 `h3-api-change-me`。服务会打印警告；对外监听前必须替换。
 
@@ -60,7 +60,7 @@ export H3_UPSTREAMS='http://127.0.0.1:8188,http://127.0.0.1:8189'
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `H3_HOST` | `0.0.0.0` | 监听地址 |
-| `H3_PORT` | `8193` | 监听端口 |
+| `H3_PORT` | `8191` | 监听端口 |
 | `H3_ADMIN_TOKEN` | 开发凭证 | 后台登录与管理员 Bearer Token |
 | `H3_API_TOKEN` | 开发凭证 | bootstrap 客户端凭证 |
 | `H3_UPSTREAMS` | `http://127.0.0.1:8188` | 首次启动时写入数据库的上游列表 |
@@ -89,7 +89,7 @@ bootstrap token 来自 `H3_API_TOKEN`。数据库 API Key 在后台创建，完�
 ### T2VA
 
 ```bash
-curl -sS http://127.0.0.1:8193/v1/generations \
+curl -sS http://127.0.0.1:8191/v1/generations \
   -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -108,7 +108,7 @@ curl -sS http://127.0.0.1:8193/v1/generations \
 ### I2VA / FL2VA
 
 ```bash
-curl -sS http://127.0.0.1:8193/v1/generations \
+curl -sS http://127.0.0.1:8191/v1/generations \
   -H 'Authorization: Bearer <token>' \
   -F 'mode=fl2va' \
   -F 'first_frame=@/path/first.png' \
@@ -122,7 +122,7 @@ curl -sS http://127.0.0.1:8193/v1/generations \
 ### Ref2VA
 
 ```bash
-curl -sS http://127.0.0.1:8193/v1/ref2va \
+curl -sS http://127.0.0.1:8191/v1/ref2va \
   -H 'Authorization: Bearer <token>' \
   -F 'ref_image_0=@/path/person.png' \
   -F 'ref_video_0=@/path/motion.mp4' \
@@ -159,17 +159,17 @@ JSON 调用可使用 `ref_image_names`、`ref_video_names`、`ref_video_audio_na
 查询：
 
 ```bash
-curl -H 'Authorization: Bearer <token>' http://127.0.0.1:8193/v1/queue
+curl -H 'Authorization: Bearer <token>' http://127.0.0.1:8191/v1/queue
 ```
 
 置顶、置底或移动到指定任务前后：
 
 ```bash
-curl -X PATCH http://127.0.0.1:8193/v1/jobs/<job-id>/queue \
+curl -X PATCH http://127.0.0.1:8191/v1/jobs/<job-id>/queue \
   -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
   -d '{"action":"front"}'
 
-curl -X PATCH http://127.0.0.1:8193/v1/jobs/<job-id>/queue \
+curl -X PATCH http://127.0.0.1:8191/v1/jobs/<job-id>/queue \
   -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
   -d '{"action":"before","target_job_id":"<other-job-id>"}'
 ```
@@ -180,17 +180,55 @@ curl -X PATCH http://127.0.0.1:8193/v1/jobs/<job-id>/queue \
 
 管理员可在后台暂停或恢复全局分发。暂停期间仍接受新任务。
 
+## 细粒度进度
+
+中间件为每个 ComfyUI 上游建立独立 WebSocket，并将 ComfyUI 的节点进度实时映射到中间件任务。客户端使用原有任务详情，或只查询进度端点：
+
+```bash
+curl -H 'Authorization: Bearer <token>' \
+  http://127.0.0.1:8191/v1/jobs/<job-id>/progress
+```
+
+响应示例：
+
+```json
+{
+  "ok": true,
+  "job_id": "<job-id>",
+  "status": "running",
+  "progress": {
+    "source": "comfy_websocket",
+    "phase": "dit_sampling",
+    "node": {"id": "10", "type": "SamplerCustomAdvanced", "state": "running"},
+    "step": {"value": 8, "max": 20, "percent": 40.0},
+    "workflow": {
+      "completed_nodes": 9,
+      "total_nodes": 17,
+      "percent": 55.29,
+      "method": "node_weighted"
+    },
+    "eta_seconds": 42.5,
+    "eta_scope": "current_node",
+    "updated_at": 1787200000.0
+  }
+}
+```
+
+`phase` 会区分 `model_loading`、`conditioning`、`dit_sampling`、`vae_decoding`、`video_encoding` 等阶段。`step` 是当前节点内部的小进度；仅当节点上报数值进度时才有值。`eta_seconds` 根据当前节点已经完成的步数估算，只代表当前节点，不是整条工作流 ETA。`workflow.percent` 按已完成节点和当前节点进度加权，是展示用估值，不代表各节点耗时相同。
+
+进度会写入 SQLite，服务重启后仍可查询最后一次状态。客户端可按 0.5 至 1 秒轮询；完整任务响应 `GET /v1/jobs/<job-id>` 中也包含相同的 `progress` 字段。
+
 ## 取消与结果
 
 ```bash
 curl -X POST -H 'Authorization: Bearer <token>' \
-  http://127.0.0.1:8193/v1/jobs/<job-id>/cancel
+  http://127.0.0.1:8191/v1/jobs/<job-id>/cancel
 
 curl -H 'Authorization: Bearer <token>' \
-  http://127.0.0.1:8193/v1/jobs/<job-id>
+  http://127.0.0.1:8191/v1/jobs/<job-id>
 
 curl -H 'Authorization: Bearer <token>' \
-  http://127.0.0.1:8193/v1/jobs/<job-id>/video -o output.mp4
+  http://127.0.0.1:8191/v1/jobs/<job-id>/video -o output.mp4
 ```
 
 本地排队任务直接转为 `canceled`。已下发任务优先调用 ComfyUI 的原子 `POST /api/jobs/{prompt_id}/cancel`；旧上游回退到 queue 快照、pending delete 和定向 interrupt。
