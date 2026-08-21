@@ -343,6 +343,42 @@ class GatewayServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(job["prompt_id"], rejected.prompts)
         self.assertIn(job["prompt_id"], accepted.prompts)
 
+    async def test_disabled_upstream_is_excluded_from_dispatch_and_health(self) -> None:
+        disabled = await self.fake()
+        enabled = await self.fake()
+        self.service = GatewayService(settings(Path(self.tempdir.name), (disabled.base_url, enabled.base_url)))
+        await self.service.start()
+        upstreams = await self.service.database.list_upstreams()
+        disabled_config = next(item for item in upstreams if item["base_url"] == disabled.base_url)
+        enabled_config = next(item for item in upstreams if item["base_url"] == enabled.base_url)
+        required = {
+            item["id"]: MiniMaxH3Adapter().required_nodes("t2va")
+            for item in upstreams
+        }
+        stale_candidates = await self.service._manager().candidates(
+            "minimax-h3-native", required, active_counts={}
+        )
+        self.assertEqual(stale_candidates[0]["id"], disabled_config["id"])
+        await self.service.set_queue_paused(True)
+
+        updated = await self.service.update_upstream(disabled_config["id"], {"enabled": False})
+        self.assertFalse(updated["enabled"])
+        summary = await self.service.summary()
+        self.assertEqual(summary["upstreams"]["healthy"], 1)
+        self.assertEqual(summary["upstreams"]["total"], 2)
+
+        job_id = "22222222-2222-4222-8222-222222222227"
+        await self.service.submit(job_id, {"prompt": "clouds"}, {}, "test")
+        claimed = await self.service.database.claim_job(job_id)
+        await self.service._dispatch_job(claimed, stale_candidates)
+        job = await wait_status(self.service, job_id, {"succeeded"})
+        self.assertEqual(job["upstream_id"], enabled_config["id"])
+        self.assertFalse(disabled.prompts)
+
+        updated = await self.service.update_upstream(disabled_config["id"], {"enabled": True})
+        self.assertTrue(updated["enabled"])
+        self.assertTrue(updated["runtime"]["healthy"])
+
     async def test_asset_upload_fails_over_to_second_upstream(self) -> None:
         rejected = await self.fake(reject_uploads=True)
         accepted = await self.fake()

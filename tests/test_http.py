@@ -185,6 +185,25 @@ class HttpApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertTrue((await response.json())["canceled"])
 
+    async def test_admin_can_disable_and_enable_an_upstream(self) -> None:
+        await self.client.post("/admin/api/login", json={"token": "admin"})
+        response = await self.client.get("/admin/api/upstreams")
+        upstream_id = (await response.json())["upstreams"][0]["id"]
+
+        response = await self.client.patch(f"/admin/api/upstreams/{upstream_id}", json={"enabled": False})
+        self.assertEqual(response.status, 200)
+        self.assertFalse((await response.json())["upstream"]["enabled"])
+        response = await self.client.get("/health")
+        health = await response.json()
+        self.assertFalse(health["ok"])
+        self.assertEqual(health["healthy_upstreams"], 0)
+
+        response = await self.client.patch(f"/admin/api/upstreams/{upstream_id}", json={"enabled": True})
+        self.assertEqual(response.status, 200)
+        upstream = (await response.json())["upstream"]
+        self.assertTrue(upstream["enabled"])
+        self.assertTrue(upstream["runtime"]["healthy"])
+
     async def test_admin_exposes_comfy_atomic_controls(self) -> None:
         await self.client.post("/admin/api/login", json={"token": "admin"})
         response = await self.client.get("/admin/api/upstreams")

@@ -267,7 +267,10 @@ class GatewayService:
 
     async def health(self) -> dict[str, Any]:
         upstreams = await self.list_upstreams(public=True)
-        healthy = sum(1 for upstream in upstreams if upstream["runtime"]["healthy"])
+        healthy = sum(
+            1 for upstream in upstreams
+            if upstream["enabled"] and upstream["runtime"]["healthy"]
+        )
         queue = await self.database.queue_snapshot()
         return {
             "ok": healthy > 0,
@@ -284,7 +287,7 @@ class GatewayService:
         upstreams = await self.list_upstreams(public=True)
         result["upstreams"] = {
             "total": len(upstreams),
-            "healthy": sum(1 for item in upstreams if item["runtime"]["healthy"]),
+            "healthy": sum(1 for item in upstreams if item["enabled"] and item["runtime"]["healthy"]),
             "busy": sum(1 for item in upstreams if item["runtime"]["queue_running"]),
         }
         result["queue_paused"] = await self.database.queue_paused()
@@ -306,18 +309,30 @@ class GatewayService:
         self.registry.get(normalized["adapter"])
         upstream = await self.database.create_upstream(normalized)
         await self.database.add_event("upstream.created", "upstream", upstream["id"], f"Added {upstream['name']}")
-        await self._manager().health_check(upstream, force_capabilities=True)
+        if upstream["enabled"]:
+            await self._manager().health_check(upstream, force_capabilities=True)
+            self.wake_scheduler.set()
         return (await self.list_upstreams_by_id(upstream["id"]))
 
     async def update_upstream(self, upstream_id: str, values: dict[str, Any]) -> dict[str, Any]:
         normalized = self._validate_upstream(values, partial=True)
         if "adapter" in normalized:
             self.registry.get(normalized["adapter"])
+        previous = await self.database.get_upstream(upstream_id)
+        if not previous:
+            raise ValueError("upstream not found")
         upstream = await self.database.update_upstream(upstream_id, normalized)
         if not upstream:
             raise ValueError("upstream not found")
-        await self.database.add_event("upstream.updated", "upstream", upstream_id, f"Updated {upstream['name']}")
-        await self._manager().health_check(upstream, force_capabilities=True)
+        enabled_changed = previous["enabled"] != upstream["enabled"]
+        if enabled_changed:
+            action = "enabled" if upstream["enabled"] else "disabled"
+            await self.database.add_event(f"upstream.{action}", "upstream", upstream_id, f"{action.title()} {upstream['name']}")
+        else:
+            await self.database.add_event("upstream.updated", "upstream", upstream_id, f"Updated {upstream['name']}")
+        if upstream["enabled"]:
+            await self._manager().health_check(upstream, force_capabilities=True)
+            self.wake_scheduler.set()
         return await self.list_upstreams_by_id(upstream_id)
 
     async def delete_upstream(self, upstream_id: str) -> bool:
@@ -501,11 +516,17 @@ class GatewayService:
         adapter = self.registry.get(job["adapter"])
         errors: list[dict[str, Any]] = []
         dispatch_prompt_id = job.get("prompt_id")
+        attempted = False
         for upstream in candidates:
             latest = await self.database.get_job(job["id"])
             if not latest or latest["cancel_requested"]:
                 await self.database.update_job(job["id"], status="canceled", finished_at=time.time())
                 return
+            current = await self.database.get_upstream(upstream["id"])
+            if not current or not current["enabled"]:
+                continue
+            upstream = current
+            attempted = True
             if not dispatch_prompt_id:
                 dispatch_prompt_id = str(uuid.uuid4())
                 await self.database.update_job(job["id"], prompt_id=dispatch_prompt_id)
@@ -588,6 +609,15 @@ class GatewayService:
             )
             return
 
+        if not attempted:
+            await self.database.update_job(
+                job["id"],
+                status="queued",
+                attempts=max(job["attempts"] - 1, 0),
+                prompt_id=None,
+                not_before=0,
+            )
+            return
         await self._retry_or_fail(job, {"message": "all eligible upstreams rejected the job", "attempts": errors})
 
     async def _upload_assets(self, client: ComfyClient, job: dict[str, Any]) -> dict[str, list[str]]:

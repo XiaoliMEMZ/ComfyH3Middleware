@@ -211,7 +211,7 @@ function renderOverviewUpstreams() {
   }
   container.innerHTML = state.upstreams.slice(0, 4).map((item) => {
     const runtime = item.runtime || {};
-    const health = runtime.healthy ? '<span class="badge healthy">healthy</span>' : '<span class="badge unhealthy">unhealthy</span>';
+    const health = !item.enabled ? '<span class="badge neutral">disabled</span>' : runtime.healthy ? '<span class="badge healthy">healthy</span>' : '<span class="badge unhealthy">unhealthy</span>';
     return `<article class="upstream-mini">
       <header><strong>${escapeHtml(item.name)}</strong>${health}</header>
       <dl>
@@ -322,6 +322,7 @@ function renderUpstreams() {
       <div class="upstream-stat"><span>权重</span><strong>${escapeHtml(item.weight)}</strong></div>
       <div class="upstream-stat"><span>节点能力</span><strong>${runtime.node_count || 0}</strong></div>
       <div class="upstream-actions">
+        <button class="button small ${item.enabled ? "warning" : "primary"}" data-upstream-action="toggle" data-id="${item.id}">${item.enabled ? "禁用" : "启用"}</button>
         <button class="button small" data-upstream-action="test" data-id="${item.id}">检测</button>
         <button class="button small" data-upstream-action="edit" data-id="${item.id}">编辑</button>
         <button class="button small" data-upstream-action="ops" data-id="${item.id}">操作</button>
@@ -427,7 +428,12 @@ async function handleUpstreamAction(action, id) {
     return;
   }
   try {
-    if (action === "test") {
+    if (action === "toggle") {
+      const enabled = !item.enabled;
+      if (!enabled && !confirm(`禁用上游 ${item.name}？已下发任务会继续运行。`)) return;
+      await api(`/admin/api/upstreams/${id}`, { method: "PATCH", body: { enabled } });
+      toast(enabled ? "上游已启用" : "上游已禁用");
+    } else if (action === "test") {
       await api(`/admin/api/upstreams/${id}/test`, { method: "POST" });
       toast("健康检查完成");
     } else if (action === "delete") {

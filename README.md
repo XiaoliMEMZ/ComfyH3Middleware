@@ -239,6 +239,16 @@ curl -H 'Authorization: Bearer <token>' \
 
 调度候选必须同时满足：启用、健康、适配器一致、节点能力满足当前模式、占用量小于最大并发。候选按 `占用量 / 权重` 排序，相同分数轮转。
 
+管理员可以在后台“上游”页面直接禁用或重新启用单个上游，也可以调用管理 API：
+
+```bash
+curl -X PATCH http://127.0.0.1:8191/admin/api/upstreams/<upstream-id> \
+  -H 'Authorization: Bearer <admin-token>' -H 'Content-Type: application/json' \
+  -d '{"enabled":false}'
+```
+
+禁用后该上游不再接收新任务，也不会参与定时健康检查；已经下发的任务仍会继续监控和收集结果。传入 `{"enabled":true}` 可重新启用，服务会立即检查节点能力并恢复调度。
+
 上传或 `POST /prompt` 明确失败时，同一次调度会尝试下一个候选。连接在提交响应前断开时，中间件会先在原上游查询同一 prompt ID；只有确认不存在才继续，降低重复生成风险。
 
 任务已经被上游接受后，如果上游不可达，状态变为 `upstream_unreachable`，不会立即复制到另一台机器，以免两个上游同时生成。上游恢复后继续对账；上游可达但 prompt 长时间既不在队列也无历史时才按 `max_attempts` 重试。模型执行错误默认终止，可通过 `H3_RETRY_EXECUTION_ERRORS=true` 改为重试。
