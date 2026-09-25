@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
 import uuid
 from typing import Any
@@ -102,6 +103,7 @@ class GatewayService:
             raise ValueError("priority and max_attempts must be integers") from exc
         if max_attempts < 1 or max_attempts > 10:
             raise ValueError("max_attempts must be between 1 and 10")
+        group_id = await self._principal_group_id(requested_by)
         job = await self.database.create_job(
             job_id=job_id,
             mode=params["mode"],
@@ -111,13 +113,14 @@ class GatewayService:
             priority=priority,
             max_attempts=max_attempts,
             requested_by=requested_by,
+            group_id=group_id,
         )
         await self.database.add_event(
             "job.queued",
             "job",
             job_id,
             f"Queued {params['mode']} generation",
-            {"priority": priority, "requested_by": requested_by},
+            {"priority": priority, "requested_by": requested_by, "group_id": group_id},
         )
         self.wake_scheduler.set()
         return self.public_job(job)
@@ -214,8 +217,8 @@ class GatewayService:
         self.wake_scheduler.set()
         return self.public_job(job)
 
-    async def queue_snapshot(self) -> dict[str, Any]:
-        snapshot = await self.database.queue_snapshot()
+    async def queue_snapshot(self, group_id: str | None = None) -> dict[str, Any]:
+        snapshot = await self.database.queue_snapshot(group_id=group_id)
         snapshot["items"] = [self.public_job(job) for job in snapshot["items"]]
         return snapshot
 
@@ -269,7 +272,7 @@ class GatewayService:
         upstreams = await self.list_upstreams(public=True)
         healthy = sum(
             1 for upstream in upstreams
-            if upstream["enabled"] and upstream["runtime"]["healthy"]
+            if self._upstream_dispatchable(upstream)
         )
         queue = await self.database.queue_snapshot()
         return {
@@ -285,10 +288,15 @@ class GatewayService:
     async def summary(self) -> dict[str, Any]:
         result = await self.database.summary()
         upstreams = await self.list_upstreams(public=True)
+        groups = await self.list_groups()
         result["upstreams"] = {
             "total": len(upstreams),
-            "healthy": sum(1 for item in upstreams if item["enabled"] and item["runtime"]["healthy"]),
+            "healthy": sum(1 for item in upstreams if self._upstream_dispatchable(item)),
             "busy": sum(1 for item in upstreams if item["runtime"]["queue_running"]),
+        }
+        result["groups"] = {
+            "total": len(groups),
+            "enabled": sum(1 for item in groups if item["enabled"]),
         }
         result["queue_paused"] = await self.database.queue_paused()
         return result
@@ -304,8 +312,93 @@ class GatewayService:
                 upstream.pop("options", None)
         return upstreams
 
+    async def list_groups(self) -> list[dict[str, Any]]:
+        groups = await self.database.list_groups()
+        upstreams = await self.database.list_upstreams()
+        keys = await self.database.list_api_keys()
+        for group in groups:
+            assigned_upstreams = [
+                item for item in upstreams if group["id"] in item.get("group_ids", [])
+            ]
+            group["upstream_count"] = len(assigned_upstreams)
+            group["key_count"] = sum(1 for key in keys if key.get("group_id") == group["id"])
+            group["upstreams"] = [
+                {"id": item["id"], "name": item["name"]} for item in assigned_upstreams
+            ]
+        return groups
+
+    async def create_group(self, name: str, enabled: bool = True) -> dict[str, Any]:
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            raise ValueError("group name is required")
+        if any(item["name"] == normalized_name for item in await self.database.list_groups()):
+            raise ValueError("group name already exists")
+        try:
+            group = await self.database.create_group(normalized_name, bool(enabled))
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("group name already exists") from exc
+        await self.database.add_event("group.created", "group", group["id"], f"Created upstream group {group['name']}")
+        self.wake_scheduler.set()
+        return await self._group_with_assignments(group["id"])
+
+    async def update_group(self, group_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        previous = await self.database.get_group(group_id)
+        if not previous:
+            raise ValueError("group not found")
+        normalized: dict[str, Any] = {}
+        if "name" in values:
+            normalized["name"] = str(values.get("name") or "").strip()
+            if not normalized["name"]:
+                raise ValueError("group name is required")
+            groups = await self.database.list_groups()
+            if any(item["id"] != group_id and item["name"] == normalized["name"] for item in groups):
+                raise ValueError("group name already exists")
+        if "enabled" in values:
+            normalized["enabled"] = bool(values["enabled"])
+        try:
+            group = await self.database.update_group(group_id, normalized)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("group name already exists") from exc
+        if not group:
+            raise ValueError("group not found")
+        if previous["enabled"] != group["enabled"]:
+            action = "enabled" if group["enabled"] else "disabled"
+            await self.database.add_event(f"group.{action}", "group", group_id, f"{action.title()} group {group['name']}")
+        else:
+            await self.database.add_event("group.updated", "group", group_id, f"Updated group {group['name']}")
+        self.wake_scheduler.set()
+        return await self._group_with_assignments(group_id)
+
+    async def delete_group(self, group_id: str) -> bool:
+        deleted = await self.database.delete_group(group_id)
+        if deleted:
+            await self.database.add_event("group.deleted", "group", group_id, "Deleted upstream group")
+            self.wake_scheduler.set()
+        return deleted
+
+    async def _group_with_assignments(self, group_id: str) -> dict[str, Any]:
+        for group in await self.list_groups():
+            if group["id"] == group_id:
+                return group
+        raise ValueError("group not found")
+
+    @staticmethod
+    def _upstream_dispatchable(upstream: dict[str, Any]) -> bool:
+        groups = upstream.get("groups") or []
+        return bool(
+            upstream["enabled"]
+            and upstream["runtime"]["healthy"]
+            and (not groups or any(group["enabled"] for group in groups))
+        )
+
     async def create_upstream(self, values: dict[str, Any]) -> dict[str, Any]:
         normalized = self._validate_upstream(values, partial=False)
+        if "group_ids" in normalized:
+            normalized["group_ids"] = await self._normalize_group_ids(normalized["group_ids"])
+        else:
+            group_id = await self._normalize_group_id(normalized.get("group_id"))
+            normalized["group_ids"] = [group_id] if group_id else []
+        normalized["group_id"] = normalized["group_ids"][0] if normalized["group_ids"] else None
         self.registry.get(normalized["adapter"])
         upstream = await self.database.create_upstream(normalized)
         await self.database.add_event("upstream.created", "upstream", upstream["id"], f"Added {upstream['name']}")
@@ -316,6 +409,13 @@ class GatewayService:
 
     async def update_upstream(self, upstream_id: str, values: dict[str, Any]) -> dict[str, Any]:
         normalized = self._validate_upstream(values, partial=True)
+        if "group_ids" in normalized:
+            normalized["group_ids"] = await self._normalize_group_ids(normalized["group_ids"])
+            normalized["group_id"] = normalized["group_ids"][0] if normalized["group_ids"] else None
+        elif "group_id" in normalized:
+            group_id = await self._normalize_group_id(normalized["group_id"])
+            normalized["group_ids"] = [group_id] if group_id else []
+            normalized["group_id"] = group_id
         if "adapter" in normalized:
             self.registry.get(normalized["adapter"])
         previous = await self.database.get_upstream(upstream_id)
@@ -325,6 +425,7 @@ class GatewayService:
         if not upstream:
             raise ValueError("upstream not found")
         enabled_changed = previous["enabled"] != upstream["enabled"]
+        group_changed = set(previous.get("group_ids", [])) != set(upstream.get("group_ids", []))
         if enabled_changed:
             action = "enabled" if upstream["enabled"] else "disabled"
             await self.database.add_event(f"upstream.{action}", "upstream", upstream_id, f"{action.title()} {upstream['name']}")
@@ -332,6 +433,7 @@ class GatewayService:
             await self.database.add_event("upstream.updated", "upstream", upstream_id, f"Updated {upstream['name']}")
         if upstream["enabled"]:
             await self._manager().health_check(upstream, force_capabilities=True)
+        if upstream["enabled"] or group_changed:
             self.wake_scheduler.set()
         return await self.list_upstreams_by_id(upstream_id)
 
@@ -376,6 +478,12 @@ class GatewayService:
             normalized["max_concurrency"] = int(normalized["max_concurrency"])
             if normalized["max_concurrency"] < 1:
                 raise ValueError("max_concurrency must be at least 1")
+        if "group_id" in normalized and normalized["group_id"] is not None:
+            normalized["group_id"] = str(normalized["group_id"]).strip()
+            if not normalized["group_id"]:
+                normalized["group_id"] = None
+        if "group_ids" in normalized and not isinstance(normalized["group_ids"], (list, tuple, set)):
+            raise ValueError("group_ids must be an array")
         if not partial:
             normalized.setdefault("adapter", "minimax-h3-native")
         if "options" in normalized and not isinstance(normalized["options"], dict):
@@ -466,6 +574,34 @@ class GatewayService:
             raise ValueError("upstream not found")
         return upstream
 
+    async def _normalize_group_id(self, group_id: Any) -> str | None:
+        if group_id is None:
+            return None
+        value = str(group_id).strip()
+        if not value:
+            return None
+        if not await self.database.get_group(value):
+            raise ValueError("group not found")
+        return value
+
+    async def _normalize_group_ids(self, group_ids: Any) -> list[str]:
+        if group_ids is None:
+            return []
+        if not isinstance(group_ids, (list, tuple, set)):
+            raise ValueError("group_ids must be an array")
+        normalized: list[str] = []
+        for group_id in group_ids:
+            value = await self._normalize_group_id(group_id)
+            if value and value not in normalized:
+                normalized.append(value)
+        return normalized
+
+    async def _principal_group_id(self, requested_by: str | None) -> str | None:
+        if not requested_by:
+            return None
+        key = await self.database.get_api_key(requested_by)
+        return key.get("group_id") if key else None
+
     async def _scheduler_loop(self) -> None:
         while not self.stopping:
             try:
@@ -500,7 +636,9 @@ class GatewayService:
                     for upstream in upstream_configs
                     if upstream["adapter"] == job["adapter"]
                 }
-                candidates = await self._manager().candidates(job["adapter"], required, active_counts)
+                candidates = await self._manager().candidates(
+                    job["adapter"], required, active_counts, group_id=job.get("group_id")
+                )
                 if not candidates:
                     continue
                 claimed = await self.database.claim_job(job["id"])
@@ -524,6 +662,13 @@ class GatewayService:
                 return
             current = await self.database.get_upstream(upstream["id"])
             if not current or not current["enabled"]:
+                continue
+            groups = {group["id"]: group for group in current.get("groups", [])}
+            if job.get("group_id") is not None:
+                membership = groups.get(job["group_id"])
+                if not membership or not membership["enabled"]:
+                    continue
+            elif groups and not any(group["enabled"] for group in groups.values()):
                 continue
             upstream = current
             attempted = True
@@ -865,10 +1010,18 @@ class GatewayService:
             raise RuntimeError("gateway service is not started")
         return self.upstreams
 
-    async def create_api_key(self, name: str, expires_at: float | None = None) -> tuple[dict[str, Any], str]:
+    async def create_api_key(
+        self,
+        name: str,
+        expires_at: float | None = None,
+        group_id: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
         if not name.strip():
             raise ValueError("API key name is required")
-        key, token = await self.database.create_api_key(name.strip(), float(expires_at) if expires_at is not None else None)
+        group_id = await self._normalize_group_id(group_id)
+        key, token = await self.database.create_api_key(
+            name.strip(), float(expires_at) if expires_at is not None else None, group_id=group_id
+        )
         await self.database.add_event("api_key.created", "api_key", key["id"], f"Created API key {key['name']}")
         return key, token
 
@@ -883,6 +1036,20 @@ class GatewayService:
             )
         return changed
 
+    async def set_api_key_group(self, key_id: str, group_id: str | None) -> bool:
+        group_id = await self._normalize_group_id(group_id)
+        changed = await self.database.set_api_key_group(key_id, group_id)
+        if changed:
+            await self.database.add_event(
+                "api_key.group_updated",
+                "api_key",
+                key_id,
+                "Updated API key upstream group",
+                {"group_id": group_id},
+            )
+            self.wake_scheduler.set()
+        return changed
+
     async def delete_api_key(self, key_id: str) -> bool:
         changed = await self.database.delete_api_key(key_id)
         if changed:
@@ -894,6 +1061,11 @@ class GatewayService:
             "service": "h3-middleware",
             "adapters": [adapter.schema() for adapter in self.registry.list()],
             "queue_actions": ["front", "back", "before", "after"],
+            "upstream_groups": {
+                "admin_endpoint": "/admin/api/upstream-groups",
+                "key_binding": "API key group_id determines the queue and upstream scope for new jobs",
+                "upstream_membership": "upstream group_ids may contain multiple groups",
+            },
             "job_statuses": [*LOCAL_QUEUE_STATUSES, *ACTIVE_STATUSES, *TERMINAL_STATUSES],
             "progress": {
                 "endpoint": "/v1/jobs/{job_id}/progress",

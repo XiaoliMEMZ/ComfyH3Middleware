@@ -80,6 +80,7 @@ async def jobs(request: web.Request) -> web.Response:
             status=request.query.get("status"),
             mode=request.query.get("mode"),
             upstream_id=request.query.get("upstream_id"),
+            group_id=request.query.get("group_id"),
             search=request.query.get("search"),
             limit=limit,
             offset=offset,
@@ -134,7 +135,9 @@ async def reorder_job(request: web.Request) -> web.Response:
 
 @routes.get("/admin/api/queue")
 async def queue(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "queue": await service(request).queue_snapshot()})
+    return web.json_response(
+        {"ok": True, "queue": await service(request).queue_snapshot(request.query.get("group_id"))}
+    )
 
 
 @routes.post("/admin/api/queue/pause")
@@ -147,6 +150,45 @@ async def pause_queue(request: web.Request) -> web.Response:
 async def resume_queue(request: web.Request) -> web.Response:
     await service(request).set_queue_paused(False)
     return web.json_response({"ok": True, "paused": False})
+
+
+@routes.get("/admin/api/upstream-groups")
+@routes.get("/admin/api/groups")
+async def upstream_groups(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "groups": await service(request).list_groups()})
+
+
+@routes.post("/admin/api/upstream-groups")
+@routes.post("/admin/api/groups")
+async def create_upstream_group(request: web.Request) -> web.Response:
+    try:
+        body = await read_json(request)
+        group = await service(request).create_group(body.get("name"), body.get("enabled", True))
+        return web.json_response({"ok": True, "group": group}, status=201)
+    except Exception as exc:
+        return exception_response(exc)
+
+
+@routes.patch("/admin/api/upstream-groups/{group_id}")
+@routes.patch("/admin/api/groups/{group_id}")
+async def update_upstream_group(request: web.Request) -> web.Response:
+    try:
+        group = await service(request).update_group(request.match_info["group_id"], await read_json(request))
+        return web.json_response({"ok": True, "group": group})
+    except Exception as exc:
+        return exception_response(exc)
+
+
+@routes.delete("/admin/api/upstream-groups/{group_id}")
+@routes.delete("/admin/api/groups/{group_id}")
+async def delete_upstream_group(request: web.Request) -> web.Response:
+    try:
+        deleted = await service(request).delete_group(request.match_info["group_id"])
+        if not deleted:
+            return json_error("Group not found", status=404)
+        return web.json_response({"ok": True, "deleted": True})
+    except Exception as exc:
+        return exception_response(exc)
 
 
 @routes.get("/admin/api/upstreams")
@@ -364,7 +406,7 @@ async def create_api_key(request: web.Request) -> web.Response:
     try:
         body = await read_json(request)
         value, token = await service(request).create_api_key(
-            str(body.get("name") or ""), body.get("expires_at")
+            str(body.get("name") or ""), body.get("expires_at"), body.get("group_id")
         )
         return web.json_response({"ok": True, "api_key": value, "token": token}, status=201)
     except Exception as exc:
@@ -375,12 +417,20 @@ async def create_api_key(request: web.Request) -> web.Response:
 async def update_api_key(request: web.Request) -> web.Response:
     try:
         body = await read_json(request)
-        if "enabled" not in body:
-            raise ValueError("enabled is required")
-        changed = await service(request).set_api_key_enabled(request.match_info["key_id"], bool(body["enabled"]))
+        changed = False
+        if "enabled" in body:
+            changed = await service(request).set_api_key_enabled(
+                request.match_info["key_id"], bool(body["enabled"])
+            ) or changed
+        if "group_id" in body:
+            changed = await service(request).set_api_key_group(
+                request.match_info["key_id"], body["group_id"]
+            ) or changed
+        if not ("enabled" in body or "group_id" in body):
+            raise ValueError("enabled or group_id is required")
         if not changed:
             return json_error("API key not found", status=404)
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "api_key": await service(request).database.get_api_key(request.match_info["key_id"])})
     except Exception as exc:
         return exception_response(exc)
 

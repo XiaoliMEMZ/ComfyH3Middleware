@@ -92,6 +92,7 @@ class UpstreamManager:
         required_nodes: dict[str, set[str]],
         active_counts: dict[str, int],
         exclude: set[str] | None = None,
+        group_id: str | None = None,
     ) -> list[dict[str, Any]]:
         exclude = exclude or set()
         upstreams = await self.database.list_upstreams(enabled_only=True)
@@ -100,6 +101,13 @@ class UpstreamManager:
             if upstream["id"] in exclude:
                 continue
             if upstream["adapter"] != adapter_name:
+                continue
+            groups = {group["id"]: group for group in upstream.get("groups", [])}
+            if group_id is not None:
+                membership = groups.get(group_id)
+                if not membership or not membership["enabled"]:
+                    continue
+            elif groups and not any(group["enabled"] for group in groups.values()):
                 continue
             state = self.runtime.setdefault(upstream["id"], UpstreamRuntime())
             if not state.healthy:

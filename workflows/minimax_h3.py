@@ -50,9 +50,11 @@ DEFAULTS: dict[str, Any] = {
     "fl2va_unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
     "ref2va_unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     "weight_dtype": "default",
-    "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
     "clip_type": "minimax",
     "clip_device": "default",
+    "lora_name": None,
+    "lora_strength": 1.0,
     "filename_prefix": None,
     "format": "auto",
     "codec": "auto",
@@ -195,6 +197,20 @@ class MiniMaxH3Adapter(WorkflowAdapter):
 
         params["mode"] = mode
         params["asset_names"] = names
+        if mode in {"i2va", "fl2va"}:
+            frame_defaults = {
+                "megapixels": 0.4,
+                "sampler_name": "euler",
+                "steps": 8,
+                "shift_video": 12.0,
+                "shift_audio": 3.0,
+                "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            }
+            for key, value in frame_defaults.items():
+                if key not in raw or raw[key] in (None, ""):
+                    params[key] = value
+            if "lora_name" in raw and raw["lora_name"] in (None, ""):
+                params["lora_name"] = None
         params["duration"] = _as_float(params["duration"], "duration")
         if params["duration"] <= 0:
             raise ValueError("duration must be greater than zero")
@@ -224,10 +240,19 @@ class MiniMaxH3Adapter(WorkflowAdapter):
             params[key] = _as_float(params[key], key)
         for key in ("resolution_steps", "steps", "bit_depth"):
             params[key] = _as_int(params[key], key)
+        params["lora_strength"] = _as_float(params["lora_strength"], "lora_strength")
         if params["megapixels"] <= 0 or params["steps"] <= 0 or params["fps"] <= 0:
             raise ValueError("megapixels, steps, and fps must be greater than zero")
         if not 0 <= params["denoise"] <= 1:
             raise ValueError("denoise must be between 0 and 1")
+        if not -100 <= params["lora_strength"] <= 100:
+            raise ValueError("lora_strength must be between -100 and 100")
+        if params["lora_name"] is not None:
+            if not isinstance(params["lora_name"], str) or not params["lora_name"].strip():
+                raise ValueError("lora_name must be a non-empty file name")
+            params["lora_name"] = params["lora_name"].strip()
+            if "/" in params["lora_name"] or "\\" in params["lora_name"]:
+                raise ValueError("lora_name must be a file name without a path")
 
         params["noise_seed"] = random.randint(0, 2**63 - 1) if params["noise_seed"] is None else _as_int(params["noise_seed"], "noise_seed")
         params["use_embedded_video_audio"] = _as_bool(params["use_embedded_video_audio"], "use_embedded_video_audio")
@@ -307,10 +332,21 @@ class MiniMaxH3Adapter(WorkflowAdapter):
             },
         }
 
+        lora_name = p.get("lora_name")
+        if lora_name:
+            graph["18"] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {
+                    "model": ["3", 0],
+                    "lora_name": lora_name,
+                    "strength_model": p.get("lora_strength", 1.0),
+                },
+            }
+            model_node = "18"
         if p["shift_video"] is not None:
             graph["4"] = {
                 "class_type": "MiniMaxH3SigmaShift",
-                "inputs": {"model": ["3", 0], "shift_video": p["shift_video"], "shift_audio": p["shift_audio"]},
+                "inputs": {"model": [model_node, 0], "shift_video": p["shift_video"], "shift_audio": p["shift_audio"]},
             }
             model_node = "4"
         graph["7"] = {
@@ -453,6 +489,8 @@ class MiniMaxH3Adapter(WorkflowAdapter):
         }
         if params and params.get("shift_video") is not None:
             required.add("MiniMaxH3SigmaShift")
+        if (params and params.get("lora_name")) or (params is None and mode in {"i2va", "fl2va"}):
+            required.add("LoraLoaderModelOnly")
         if params and params.get("length_expression"):
             required.update({"PrimitiveFloat", "ComfyMathExpression"})
         if mode == "ref2va":

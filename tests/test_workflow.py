@@ -26,16 +26,32 @@ class MiniMaxH3AdapterTests(unittest.TestCase):
         self.assertEqual(params["length"], 124)
         graph = self.adapter.build(params, {})
         self.assertEqual(graph["20"]["class_type"], "MiniMaxH3ImageToVideo")
-        self.assertEqual(graph["5"]["inputs"]["clip_name"], "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors")
+        self.assertEqual(graph["5"]["inputs"]["clip_name"], "qwen3vl_32b_minimax_h3_int8_convrot.safetensors")
         self.assertNotIn("first_frame", graph["20"]["inputs"])
         self.assertEqual(graph["20"]["inputs"]["width"], 1344)
         self.assertEqual(graph["8"]["inputs"]["noise_seed"], 7)
+
+    def test_legacy_persisted_params_build_without_turbo_fields(self) -> None:
+        params = self.adapter.normalize({"prompt": "clouds", "noise_seed": 7}, {})
+        params.pop("lora_name")
+        params.pop("lora_strength")
+        graph = self.adapter.build(params, {})
+        self.assertNotIn("18", graph)
 
     def test_i2va_derives_size_from_first_frame(self) -> None:
         assets = {"first_frame": [asset("first_frame")]}
         params = self.adapter.normalize({"prompt": "move"}, assets)
         graph = self.adapter.build(params, {"first_frame": ["job/first.png"]})
         self.assertEqual(params["mode"], "i2va")
+        self.assertEqual(params["megapixels"], 0.4)
+        self.assertEqual(params["sampler_name"], "euler")
+        self.assertEqual(params["steps"], 8)
+        self.assertEqual(params["shift_video"], 12.0)
+        self.assertEqual(params["shift_audio"], 3.0)
+        self.assertEqual(params["lora_name"], "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors")
+        self.assertEqual(graph["18"]["class_type"], "LoraLoaderModelOnly")
+        self.assertEqual(graph["18"]["inputs"]["model"], ["3", 0])
+        self.assertEqual(graph["4"]["inputs"]["model"], ["18", 0])
         self.assertEqual(graph["30"]["inputs"]["image"], "job/first.png")
         self.assertEqual(graph["20"]["inputs"]["first_frame"], ["30", 0])
         self.assertEqual(graph["20"]["inputs"]["width"], ["33", 0])
@@ -55,7 +71,22 @@ class MiniMaxH3AdapterTests(unittest.TestCase):
         )
         self.assertEqual(graph["20"]["inputs"]["last_frame"], ["31", 0])
         self.assertEqual(graph["20"]["inputs"]["width"], 864)
+        self.assertEqual(graph["7"]["inputs"]["steps"], 8)
         self.assertNotIn("32", graph)
+
+    def test_frame_lora_can_be_disabled(self) -> None:
+        params = self.adapter.normalize(
+            {"mode": "fl2va", "prompt": "transition", "lora_name": ""},
+            {"first_frame": [asset("first_frame")], "last_frame": [asset("last_frame")]},
+        )
+        graph = self.adapter.build(
+            params,
+            {"first_frame": ["job/first.png"], "last_frame": ["job/last.png"]},
+        )
+        self.assertIsNone(params["lora_name"])
+        self.assertNotIn("18", graph)
+        self.assertEqual(graph["4"]["inputs"]["model"], ["3", 0])
+        self.assertNotIn("LoraLoaderModelOnly", self.adapter.required_nodes("fl2va", params=params))
 
     def test_ref2va_builds_all_reference_types(self) -> None:
         params = self.adapter.normalize(

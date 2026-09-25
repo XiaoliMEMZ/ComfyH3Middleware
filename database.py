@@ -27,6 +27,14 @@ UPSTREAM_JSON_COLUMNS = {
     "stats_json": "stats",
 }
 
+API_KEY_SELECT = """
+    SELECT api_keys.id, api_keys.name, api_keys.token_prefix, api_keys.enabled,
+        api_keys.created_at, api_keys.last_used_at, api_keys.expires_at,
+        api_keys.group_id, upstream_groups.name AS group_name
+    FROM api_keys
+    LEFT JOIN upstream_groups ON upstream_groups.id = api_keys.group_id
+"""
+
 
 def now() -> float:
     return time.time()
@@ -64,6 +72,14 @@ class Database:
         connection.execute("PRAGMA busy_timeout=5000")
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS upstream_groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS upstreams (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -71,6 +87,7 @@ class Database:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 weight REAL NOT NULL DEFAULT 1,
                 max_concurrency INTEGER NOT NULL DEFAULT 1,
+                group_id TEXT,
                 adapter TEXT NOT NULL DEFAULT 'minimax-h3-native',
                 auth_token TEXT,
                 options_json TEXT NOT NULL DEFAULT '{}',
@@ -79,8 +96,20 @@ class Database:
                 last_error TEXT,
                 stats_json TEXT NOT NULL DEFAULT '{}',
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES upstream_groups(id) ON DELETE SET NULL
             );
+
+            CREATE TABLE IF NOT EXISTS upstream_group_memberships (
+                upstream_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (upstream_id, group_id),
+                FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE CASCADE,
+                FOREIGN KEY (group_id) REFERENCES upstream_groups(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS upstream_group_memberships_group_idx
+                ON upstream_group_memberships(group_id, upstream_id);
 
             CREATE TABLE IF NOT EXISTS api_keys (
                 id TEXT PRIMARY KEY,
@@ -90,7 +119,9 @@ class Database:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL,
                 last_used_at REAL,
-                expires_at REAL
+                expires_at REAL,
+                group_id TEXT,
+                FOREIGN KEY (group_id) REFERENCES upstream_groups(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS jobs (
@@ -105,6 +136,7 @@ class Database:
                 outputs_json TEXT NOT NULL DEFAULT '[]',
                 error_json TEXT,
                 progress_json TEXT NOT NULL DEFAULT '{}',
+                group_id TEXT,
                 upstream_id TEXT,
                 prompt_id TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -117,6 +149,7 @@ class Database:
                 submitted_at REAL,
                 started_at REAL,
                 finished_at REAL,
+                FOREIGN KEY (group_id) REFERENCES upstream_groups(id) ON DELETE SET NULL,
                 FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE SET NULL
             );
 
@@ -143,9 +176,26 @@ class Database:
             );
             """
         )
-        job_columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
-        if "progress_json" not in job_columns:
-            connection.execute("ALTER TABLE jobs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'")
+        migrations = (
+            ("upstreams", "group_id", "TEXT REFERENCES upstream_groups(id) ON DELETE SET NULL"),
+            ("api_keys", "group_id", "TEXT REFERENCES upstream_groups(id) ON DELETE SET NULL"),
+            ("jobs", "progress_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("jobs", "group_id", "TEXT REFERENCES upstream_groups(id) ON DELETE SET NULL"),
+        )
+        for table, column, definition in migrations:
+            columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        connection.execute("CREATE INDEX IF NOT EXISTS upstreams_group_idx ON upstreams(group_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS api_keys_group_idx ON api_keys(group_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS jobs_group_idx ON jobs(group_id, status)")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO upstream_group_memberships(upstream_id, group_id, created_at)
+            SELECT id, group_id, ? FROM upstreams WHERE group_id IS NOT NULL
+            """,
+            (now(),),
+        )
         connection.execute(
             "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES('queue_paused', 'false', ?)",
             (now(),),
@@ -169,6 +219,82 @@ class Database:
             raise RuntimeError("database is not initialized")
         return self.connection
 
+    async def create_group(self, name: str, enabled: bool = True) -> dict[str, Any]:
+        group_id = str(uuid.uuid4())
+        timestamp = now()
+        async with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO upstream_groups(id, name, enabled, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (group_id, name, int(enabled), timestamp, timestamp),
+            )
+            self.conn.commit()
+        group = await self.get_group(group_id)
+        if group is None:
+            raise RuntimeError("failed to create upstream group")
+        return group
+
+    async def get_group(self, group_id: str) -> dict[str, Any] | None:
+        async with self.lock:
+            row = self.conn.execute("SELECT * FROM upstream_groups WHERE id=?", (group_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["enabled"] = bool(item["enabled"])
+        return item
+
+    async def list_groups(self) -> list[dict[str, Any]]:
+        async with self.lock:
+            rows = self.conn.execute("SELECT * FROM upstream_groups ORDER BY name, id").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["enabled"] = bool(item["enabled"])
+            result.append(item)
+        return result
+
+    async def update_group(self, group_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
+        allowed = {"name", "enabled"}
+        assignments: list[str] = []
+        params: list[Any] = []
+        for key, value in values.items():
+            if key not in allowed:
+                continue
+            if key == "enabled":
+                value = int(bool(value))
+            assignments.append(f"{key}=?")
+            params.append(value)
+        if not assignments:
+            return await self.get_group(group_id)
+        assignments.append("updated_at=?")
+        params.extend((now(), group_id))
+        async with self.lock:
+            self.conn.execute(
+                f"UPDATE upstream_groups SET {', '.join(assignments)} WHERE id=?", params
+            )
+            self.conn.commit()
+        return await self.get_group(group_id)
+
+    async def delete_group(self, group_id: str) -> bool:
+        async with self.lock:
+            assignments = self.conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM upstream_group_memberships WHERE group_id=?) AS upstreams,
+                    (SELECT COUNT(*) FROM api_keys WHERE group_id=?) AS api_keys,
+                    (SELECT COUNT(*) FROM jobs WHERE group_id=? AND status IN (?, ?, ?, ?, ?, ?, ?)) AS jobs
+                """,
+                (group_id, group_id, group_id, *LOCAL_QUEUE_STATUSES, *ACTIVE_STATUSES),
+            ).fetchone()
+            if any(assignments):
+                raise ValueError("group still has assigned upstreams, API keys, or active jobs")
+            self.conn.execute("UPDATE jobs SET group_id=NULL WHERE group_id=?", (group_id,))
+            cursor = self.conn.execute("DELETE FROM upstream_groups WHERE id=?", (group_id,))
+            self.conn.commit()
+            return cursor.rowcount > 0
+
     async def seed_upstreams(self, base_urls: tuple[str, ...]) -> None:
         async with self.lock:
             timestamp = now()
@@ -189,13 +315,17 @@ class Database:
     async def create_upstream(self, values: dict[str, Any]) -> dict[str, Any]:
         upstream_id = str(uuid.uuid4())
         timestamp = now()
+        group_ids = list(dict.fromkeys(values.get("group_ids") or []))
+        if "group_ids" not in values and values.get("group_id"):
+            group_ids = [values["group_id"]]
+        legacy_group_id = group_ids[0] if group_ids else None
         async with self.lock:
             self.conn.execute(
                 """
                 INSERT INTO upstreams(
-                    id, name, base_url, enabled, weight, max_concurrency,
+                    id, name, base_url, enabled, weight, max_concurrency, group_id,
                     adapter, auth_token, options_json, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     upstream_id,
@@ -204,12 +334,20 @@ class Database:
                     int(values.get("enabled", True)),
                     float(values.get("weight", 1)),
                     int(values.get("max_concurrency", 1)),
+                    legacy_group_id,
                     values.get("adapter", "minimax-h3-native"),
                     values.get("auth_token") or None,
                     _json(values.get("options") or {}),
                     timestamp,
                     timestamp,
                 ),
+            )
+            self.conn.executemany(
+                """
+                INSERT INTO upstream_group_memberships(upstream_id, group_id, created_at)
+                VALUES(?, ?, ?)
+                """,
+                ((upstream_id, group_id, timestamp) for group_id in group_ids),
             )
             self.conn.commit()
         return await self.get_upstream(upstream_id)
@@ -221,13 +359,22 @@ class Database:
             "enabled",
             "weight",
             "max_concurrency",
+            "group_id",
             "adapter",
             "auth_token",
             "options",
         }
+        group_ids: list[str] | None = None
+        if "group_ids" in values:
+            group_ids = list(dict.fromkeys(values.get("group_ids") or []))
+        elif "group_id" in values:
+            group_ids = [values["group_id"]] if values.get("group_id") else []
+        sql_values = dict(values)
+        if group_ids is not None:
+            sql_values["group_id"] = group_ids[0] if group_ids else None
         assignments: list[str] = []
         params: list[Any] = []
-        for key, value in values.items():
+        for key, value in sql_values.items():
             if key not in allowed:
                 continue
             column = "options_json" if key == "options" else key
@@ -239,12 +386,23 @@ class Database:
                 value = str(value).rstrip("/")
             assignments.append(f"{column}=?")
             params.append(value)
-        if not assignments:
+        if not assignments and group_ids is None:
             return await self.get_upstream(upstream_id)
         assignments.append("updated_at=?")
         params.extend((now(), upstream_id))
         async with self.lock:
             self.conn.execute(f"UPDATE upstreams SET {', '.join(assignments)} WHERE id=?", params)
+            if group_ids is not None:
+                self.conn.execute(
+                    "DELETE FROM upstream_group_memberships WHERE upstream_id=?", (upstream_id,)
+                )
+                self.conn.executemany(
+                    """
+                    INSERT INTO upstream_group_memberships(upstream_id, group_id, created_at)
+                    VALUES(?, ?, ?)
+                    """,
+                    ((upstream_id, group_id, now()) for group_id in group_ids),
+                )
             self.conn.commit()
         return await self.get_upstream(upstream_id)
 
@@ -263,7 +421,8 @@ class Database:
     async def get_upstream(self, upstream_id: str) -> dict[str, Any] | None:
         async with self.lock:
             row = self.conn.execute("SELECT * FROM upstreams WHERE id=?", (upstream_id,)).fetchone()
-        return self._upstream(row) if row else None
+            groups = self._upstream_groups_locked((upstream_id,))
+        return self._upstream(row, groups.get(upstream_id, [])) if row else None
 
     async def list_upstreams(self, enabled_only: bool = False) -> list[dict[str, Any]]:
         query = "SELECT * FROM upstreams"
@@ -273,7 +432,31 @@ class Database:
         query += " ORDER BY name, id"
         async with self.lock:
             rows = self.conn.execute(query, params).fetchall()
-        return [self._upstream(row) for row in rows]
+            groups = self._upstream_groups_locked(tuple(row["id"] for row in rows))
+        return [self._upstream(row, groups.get(row["id"], [])) for row in rows]
+
+    def _upstream_groups_locked(
+        self, upstream_ids: tuple[str, ...]
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not upstream_ids:
+            return {}
+        placeholders = ",".join("?" for _ in upstream_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT memberships.upstream_id, groups.id, groups.name, groups.enabled
+            FROM upstream_group_memberships AS memberships
+            JOIN upstream_groups AS groups ON groups.id=memberships.group_id
+            WHERE memberships.upstream_id IN ({placeholders})
+            ORDER BY groups.name, groups.id
+            """,
+            upstream_ids,
+        ).fetchall()
+        result: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            result.setdefault(row["upstream_id"], []).append(
+                {"id": row["id"], "name": row["name"], "enabled": bool(row["enabled"])}
+            )
+        return result
 
     async def set_upstream_health(
         self,
@@ -294,25 +477,40 @@ class Database:
             self.conn.commit()
 
     @staticmethod
-    def _upstream(row: sqlite3.Row) -> dict[str, Any]:
+    def _upstream(row: sqlite3.Row, groups: list[dict[str, Any]]) -> dict[str, Any]:
         item = dict(row)
         for column, key in UPSTREAM_JSON_COLUMNS.items():
             item[key] = _decode_json(item.pop(column), {})
         item["enabled"] = bool(item["enabled"])
         item["healthy"] = bool(item["healthy"])
+        item["groups"] = groups
+        item["group_ids"] = [group["id"] for group in groups]
+        primary = next(
+            (group for group in groups if group["id"] == item.get("group_id")),
+            groups[0] if groups else None,
+        )
+        item["group_id"] = primary["id"] if primary else None
+        item["group_name"] = primary["name"] if primary else None
+        item["group_enabled"] = primary["enabled"] if primary else None
         return item
 
-    async def create_api_key(self, name: str, expires_at: float | None = None) -> tuple[dict[str, Any], str]:
+    async def create_api_key(
+        self,
+        name: str,
+        expires_at: float | None = None,
+        group_id: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
         raw_token = f"h3_{secrets.token_urlsafe(32)}"
         key_id = str(uuid.uuid4())
         timestamp = now()
         async with self.lock:
             self.conn.execute(
                 """
-                INSERT INTO api_keys(id, name, token_hash, token_prefix, enabled, created_at, expires_at)
-                VALUES(?, ?, ?, ?, 1, ?, ?)
+                INSERT INTO api_keys(
+                    id, name, token_hash, token_prefix, enabled, created_at, expires_at, group_id
+                ) VALUES(?, ?, ?, ?, 1, ?, ?, ?)
                 """,
-                (key_id, name, hash_token(raw_token), raw_token[:11], timestamp, expires_at),
+                (key_id, name, hash_token(raw_token), raw_token[:11], timestamp, expires_at, group_id),
             )
             self.conn.commit()
         key = await self.get_api_key(key_id)
@@ -323,26 +521,17 @@ class Database:
     async def get_api_key(self, key_id: str) -> dict[str, Any] | None:
         async with self.lock:
             row = self.conn.execute(
-                "SELECT id, name, token_prefix, enabled, created_at, last_used_at, expires_at FROM api_keys WHERE id=?",
+                f"{API_KEY_SELECT} WHERE api_keys.id=?",
                 (key_id,),
             ).fetchone()
         if not row:
             return None
-        item = dict(row)
-        item["enabled"] = bool(item["enabled"])
-        return item
+        return self._api_key(row)
 
     async def list_api_keys(self) -> list[dict[str, Any]]:
         async with self.lock:
-            rows = self.conn.execute(
-                "SELECT id, name, token_prefix, enabled, created_at, last_used_at, expires_at FROM api_keys ORDER BY created_at DESC"
-            ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["enabled"] = bool(item["enabled"])
-            result.append(item)
-        return result
+            rows = self.conn.execute(f"{API_KEY_SELECT} ORDER BY api_keys.created_at DESC").fetchall()
+        return [self._api_key(row) for row in rows]
 
     async def validate_api_key(self, token: str) -> str | None:
         digest = hash_token(token)
@@ -366,11 +555,25 @@ class Database:
             self.conn.commit()
             return cursor.rowcount > 0
 
+    async def set_api_key_group(self, key_id: str, group_id: str | None) -> bool:
+        async with self.lock:
+            cursor = self.conn.execute(
+                "UPDATE api_keys SET group_id=? WHERE id=?", (group_id, key_id)
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+
     async def delete_api_key(self, key_id: str) -> bool:
         async with self.lock:
             cursor = self.conn.execute("DELETE FROM api_keys WHERE id=?", (key_id,))
             self.conn.commit()
             return cursor.rowcount > 0
+
+    @staticmethod
+    def _api_key(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["enabled"] = bool(item["enabled"])
+        return item
 
     async def create_job(
         self,
@@ -382,18 +585,23 @@ class Database:
         priority: int,
         max_attempts: int,
         requested_by: str | None,
+        group_id: str | None = None,
     ) -> dict[str, Any]:
         timestamp = now()
         async with self.lock:
+            group_clause = "group_id IS NULL" if group_id is None else "group_id=?"
+            group_params: tuple[Any, ...] = () if group_id is None else (group_id,)
             queue_order = self.conn.execute(
-                "SELECT COALESCE(MAX(queue_order), 0) + 1000 FROM jobs WHERE status IN ('queued', 'retrying')"
+                f"SELECT COALESCE(MAX(queue_order), 0) + 1000 FROM jobs "
+                f"WHERE status IN ('queued', 'retrying') AND {group_clause}",
+                group_params,
             ).fetchone()[0]
             self.conn.execute(
                 """
                 INSERT INTO jobs(
                     id, status, mode, adapter, priority, queue_order, params_json,
-                    assets_json, max_attempts, requested_by, created_at, updated_at
-                ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    assets_json, group_id, max_attempts, requested_by, created_at, updated_at
+                ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -403,6 +611,7 @@ class Database:
                     queue_order,
                     _json(params),
                     _json(assets),
+                    group_id,
                     max_attempts,
                     requested_by,
                     timestamp,
@@ -429,6 +638,7 @@ class Database:
         mode: str | None = None,
         upstream_id: str | None = None,
         requested_by: str | None = None,
+        group_id: str | None = None,
         search: str | None = None,
         limit: int = 100,
         offset: int = 0,
@@ -447,6 +657,9 @@ class Database:
         if requested_by:
             clauses.append("requested_by=?")
             params.append(requested_by)
+        if group_id:
+            clauses.append("group_id=?")
+            params.append(group_id)
         if search:
             clauses.append("(id LIKE ? OR params_json LIKE ?)")
             params.extend((f"%{search}%", f"%{search}%"))
@@ -521,6 +734,7 @@ class Database:
             "outputs",
             "error",
             "progress",
+            "group_id",
             "upstream_id",
             "prompt_id",
             "attempts",
@@ -584,18 +798,26 @@ class Database:
                 raise ValueError("job not found")
             if job["status"] not in LOCAL_QUEUE_STATUSES:
                 raise ValueError("only locally queued jobs can be reordered")
+            group_clause = "group_id IS NULL" if job["group_id"] is None else "group_id=?"
+            group_params: tuple[Any, ...] = () if job["group_id"] is None else (job["group_id"],)
 
             if action == "front":
                 priority = self.conn.execute(
-                    "SELECT COALESCE(MAX(priority), 0) + 1 FROM jobs WHERE status IN ('queued', 'retrying')"
+                    f"SELECT COALESCE(MAX(priority), 0) + 1 FROM jobs "
+                    f"WHERE status IN ('queued', 'retrying') AND {group_clause}",
+                    group_params,
                 ).fetchone()[0]
                 self.conn.execute("UPDATE jobs SET priority=?, queue_order=0, updated_at=? WHERE id=?", (priority, now(), job_id))
             elif action == "back":
                 priority = self.conn.execute(
-                    "SELECT COALESCE(MIN(priority), 0) - 1 FROM jobs WHERE status IN ('queued', 'retrying')"
+                    f"SELECT COALESCE(MIN(priority), 0) - 1 FROM jobs "
+                    f"WHERE status IN ('queued', 'retrying') AND {group_clause}",
+                    group_params,
                 ).fetchone()[0]
                 queue_order = self.conn.execute(
-                    "SELECT COALESCE(MAX(queue_order), 0) + 1000 FROM jobs WHERE status IN ('queued', 'retrying')"
+                    f"SELECT COALESCE(MAX(queue_order), 0) + 1000 FROM jobs "
+                    f"WHERE status IN ('queued', 'retrying') AND {group_clause}",
+                    group_params,
                 ).fetchone()[0]
                 self.conn.execute(
                     "UPDATE jobs SET priority=?, queue_order=?, updated_at=? WHERE id=?",
@@ -607,14 +829,16 @@ class Database:
                 target = self.conn.execute("SELECT * FROM jobs WHERE id=?", (target_job_id,)).fetchone()
                 if not target or target["status"] not in LOCAL_QUEUE_STATUSES:
                     raise ValueError("target job is not locally queued")
+                if target["group_id"] != job["group_id"]:
+                    raise ValueError("target job is not in the same queue group")
                 priority = target["priority"]
                 rows = self.conn.execute(
-                    """
+                    f"""
                     SELECT id FROM jobs
-                    WHERE status IN ('queued', 'retrying') AND priority=? AND id<>?
+                    WHERE status IN ('queued', 'retrying') AND priority=? AND id<>? AND {group_clause}
                     ORDER BY queue_order, created_at
                     """,
-                    (priority, job_id),
+                    (priority, job_id, *group_params),
                 ).fetchall()
                 ids = [row["id"] for row in rows]
                 target_index = ids.index(target_job_id)
@@ -653,7 +877,14 @@ class Database:
             if row["status"] not in TERMINAL_STATUSES:
                 raise ValueError("only terminal jobs can be retried")
             queue_order = self.conn.execute(
-                "SELECT COALESCE(MAX(queue_order), 0) + 1000 FROM jobs WHERE status IN ('queued', 'retrying')"
+                (
+                    "SELECT COALESCE(MAX(queue_order), 0) + 1000 FROM jobs "
+                    "WHERE status IN ('queued', 'retrying') AND group_id IS NULL"
+                    if row["group_id"] is None
+                    else "SELECT COALESCE(MAX(queue_order), 0) + 1000 FROM jobs "
+                    "WHERE status IN ('queued', 'retrying') AND group_id=?"
+                ),
+                () if row["group_id"] is None else (row["group_id"],),
             ).fetchone()[0]
             self.conn.execute(
                 """
@@ -668,13 +899,20 @@ class Database:
             updated = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return self._job(updated)
 
-    async def queue_snapshot(self) -> dict[str, Any]:
+    async def queue_snapshot(self, group_id: str | None = None) -> dict[str, Any]:
+        group_clause = ""
+        group_params: tuple[Any, ...] = ()
+        if group_id:
+            group_clause = " AND group_id=?"
+            group_params = (group_id,)
         async with self.lock:
             rows = self.conn.execute(
-                """
+                f"""
                 SELECT * FROM jobs WHERE status IN ('queued', 'retrying')
+                {group_clause}
                 ORDER BY priority DESC, queue_order ASC, created_at ASC
-                """
+                """,
+                group_params,
             ).fetchall()
             paused_row = self.conn.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
         return {"paused": paused_row["value"] == "true", "items": [self._job(row) for row in rows]}

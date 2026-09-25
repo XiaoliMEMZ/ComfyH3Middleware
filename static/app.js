@@ -6,6 +6,7 @@ const state = {
   summary: null,
   jobs: [],
   upstreams: [],
+  groups: [],
   queue: { paused: false, items: [] },
   keys: [],
   events: [],
@@ -16,6 +17,7 @@ const viewMeta = {
   overview: ["概览", "集群状态与近期任务"],
   jobs: ["任务", "查询、取消与重试"],
   queue: ["队列", "中间件持久化调度顺序"],
+  groups: ["分组", "按 API Key 隔离上游与队列"],
   upstreams: ["上游", "ComfyUI 健康、容量与原子操作"],
   keys: ["API Keys", "客户端调用凭证"],
 };
@@ -120,6 +122,45 @@ function upstreamName(id) {
   return state.upstreams.find((item) => item.id === id)?.name || (id ? shortId(id) : "-");
 }
 
+function groupName(id) {
+  return state.groups.find((item) => item.id === id)?.name || (id ? shortId(id) : "未分组");
+}
+
+function groupOptions(selected = "") {
+  return [`<option value="">未分组（全局调度）</option>`, ...state.groups.map((group) =>
+    `<option value="${escapeHtml(group.id)}" ${group.id === selected ? "selected" : ""}>${escapeHtml(group.name)}${group.enabled ? "" : "（已禁用）"}</option>`
+  )].join("");
+}
+
+function upstreamGroupIds(item) {
+  if (Array.isArray(item?.group_ids)) return item.group_ids;
+  return item?.group_id ? [item.group_id] : [];
+}
+
+function upstreamGroupChoices(selected = []) {
+  if (!state.groups.length) return '<span class="group-check-empty">尚未创建分组</span>';
+  const selectedIds = new Set(selected);
+  return state.groups.map((group) => `<label class="group-check-option">
+    <input type="checkbox" value="${escapeHtml(group.id)}" ${selectedIds.has(group.id) ? "checked" : ""}>
+    <span>${escapeHtml(group.name)}</span>
+    ${group.enabled ? "" : '<small>已禁用</small>'}
+  </label>`).join("");
+}
+
+function upstreamGroupNames(item) {
+  const names = upstreamGroupIds(item).map((id) => groupName(id));
+  return names.length ? names.join("、") : "未分组";
+}
+
+function upstreamStatus(item) {
+  const runtime = item.runtime || {};
+  if (!item.enabled) return '<span class="badge neutral">disabled</span>';
+  const groups = item.groups || [];
+  if (groups.length && !groups.some((group) => group.enabled)) return '<span class="badge neutral">groups disabled</span>';
+  if (!groups.length && item.group_id && item.group_enabled === false) return '<span class="badge neutral">group disabled</span>';
+  return runtime.healthy ? '<span class="badge healthy">healthy</span>' : '<span class="badge unhealthy">unhealthy</span>';
+}
+
 function emptyRow(columns, message) {
   return `<tr class="empty-row"><td colspan="${columns}">${escapeHtml(message)}</td></tr>`;
 }
@@ -147,12 +188,22 @@ async function loadJobs() {
   $("#job-count").textContent = `${result.total} 条任务`;
 }
 
+async function loadGroups() {
+  try {
+    return await api("/admin/api/upstream-groups");
+  } catch (error) {
+    if (error.message.includes("404")) return { groups: [] };
+    throw error;
+  }
+}
+
 async function refreshAll(showNotice = false) {
   if (!state.authenticated) return;
   try {
-    const [summary, upstreams, queue, keys, events] = await Promise.all([
+    const [summary, upstreams, groups, queue, keys, events] = await Promise.all([
       api("/admin/api/summary"),
       api("/admin/api/upstreams"),
+      loadGroups(),
       api("/admin/api/queue"),
       api("/admin/api/api-keys"),
       api("/admin/api/events?limit=30"),
@@ -160,6 +211,7 @@ async function refreshAll(showNotice = false) {
     ]);
     state.summary = summary.summary;
     state.upstreams = upstreams.upstreams;
+    state.groups = groups.groups;
     state.queue = queue.queue;
     state.keys = keys.api_keys;
     state.events = events.events;
@@ -179,6 +231,7 @@ function renderAll() {
   renderRecentJobs();
   renderJobs();
   renderQueue();
+  renderGroups();
   renderUpstreams();
   renderKeys();
 }
@@ -211,9 +264,8 @@ function renderOverviewUpstreams() {
   }
   container.innerHTML = state.upstreams.slice(0, 4).map((item) => {
     const runtime = item.runtime || {};
-    const health = !item.enabled ? '<span class="badge neutral">disabled</span>' : runtime.healthy ? '<span class="badge healthy">healthy</span>' : '<span class="badge unhealthy">unhealthy</span>';
     return `<article class="upstream-mini">
-      <header><strong>${escapeHtml(item.name)}</strong>${health}</header>
+      <header><strong>${escapeHtml(item.name)}</strong>${upstreamStatus(item)}</header>
       <dl>
         <div><dt>运行</dt><dd>${runtime.queue_running || 0}</dd></div>
         <div><dt>等待</dt><dd>${runtime.queue_pending || 0}</dd></div>
@@ -295,7 +347,7 @@ function renderQueue() {
   }
   list.innerHTML = state.queue.items.map((job, index) => `<article class="queue-item">
     <div class="queue-rank">${String(index + 1).padStart(2, "0")}</div>
-    <div><strong>${escapeHtml(shortId(job.id))} · ${escapeHtml(job.mode.toUpperCase())}</strong><small>${escapeHtml(jobPrompt(job))}</small></div>
+    <div><strong>${escapeHtml(shortId(job.id))} · ${escapeHtml(job.mode.toUpperCase())}</strong><small>${escapeHtml(groupName(job.group_id))} · ${escapeHtml(jobPrompt(job))}</small></div>
     <div><span class="badge warning">P${escapeHtml(job.priority)}</span></div>
     <div>${formatTime(job.created_at)}</div>
     <div class="row-actions">
@@ -306,6 +358,28 @@ function renderQueue() {
   </article>`).join("");
 }
 
+function renderGroups() {
+  const list = $("#group-list");
+  if (!state.groups.length) {
+    list.innerHTML = '<div class="group-row"><div><strong>尚未创建分组</strong><span>未绑定分组的旧 Key 仍使用全局调度</span></div></div>';
+    return;
+  }
+  list.innerHTML = state.groups.map((group) => {
+    const upstreams = (group.upstreams || []).map((item) => item.name).join("、") || "暂无上游";
+    const status = group.enabled ? '<span class="badge success">enabled</span>' : '<span class="badge neutral">disabled</span>';
+    return `<article class="group-row">
+      <div class="group-identity"><header><strong>${escapeHtml(group.name)}</strong>${status}</header><span>${escapeHtml(upstreams)}</span></div>
+      <div class="group-stat"><span>上游</span><strong>${escapeHtml(group.upstream_count)}</strong></div>
+      <div class="group-stat"><span>API Key</span><strong>${escapeHtml(group.key_count)}</strong></div>
+      <div class="group-actions">
+        <button class="button small ${group.enabled ? "warning" : "primary"}" data-group-action="toggle" data-id="${group.id}">${group.enabled ? "禁用" : "启用"}</button>
+        <button class="button small" data-group-action="edit" data-id="${group.id}">编辑</button>
+        <button class="button small danger" data-group-action="delete" data-id="${group.id}">删除</button>
+      </div>
+    </article>`;
+  }).join("");
+}
+
 function renderUpstreams() {
   const list = $("#upstream-list");
   if (!state.upstreams.length) {
@@ -314,9 +388,8 @@ function renderUpstreams() {
   }
   list.innerHTML = state.upstreams.map((item) => {
     const runtime = item.runtime || {};
-    const status = !item.enabled ? '<span class="badge neutral">disabled</span>' : runtime.healthy ? '<span class="badge healthy">healthy</span>' : '<span class="badge unhealthy">unhealthy</span>';
     return `<article class="upstream-row">
-      <div class="upstream-identity"><header><strong>${escapeHtml(item.name)}</strong>${status}</header><code title="${escapeHtml(item.base_url)}">${escapeHtml(item.base_url)}</code></div>
+      <div class="upstream-identity"><header><strong>${escapeHtml(item.name)}</strong>${upstreamStatus(item)}</header><code title="${escapeHtml(item.base_url)}">${escapeHtml(item.base_url)}</code><small class="assignment-label">${escapeHtml(upstreamGroupNames(item))}</small></div>
       <div class="upstream-stat"><span>运行 / 等待</span><strong>${runtime.queue_running || 0} / ${runtime.queue_pending || 0}</strong></div>
       <div class="upstream-stat"><span>最大并发</span><strong>${escapeHtml(item.max_concurrency)}</strong></div>
       <div class="upstream-stat"><span>权重</span><strong>${escapeHtml(item.weight)}</strong></div>
@@ -335,14 +408,15 @@ function renderUpstreams() {
 function renderKeys() {
   const body = $("#keys-body");
   if (!state.keys.length) {
-    body.innerHTML = emptyRow(7, "尚未创建数据库 API Key；环境变量中的 bootstrap key 仍可使用");
+    body.innerHTML = emptyRow(8, "尚未创建数据库 API Key；环境变量中的 bootstrap key 仍可使用");
     return;
   }
   body.innerHTML = state.keys.map((key) => `<tr>
-    <td>${escapeHtml(key.name)}</td><td><code>${escapeHtml(key.token_prefix)}...</code></td>
+    <td>${escapeHtml(key.name)}</td><td><code>${escapeHtml(key.token_prefix)}...</code></td><td>${escapeHtml(groupName(key.group_id))}</td>
     <td>${key.enabled ? '<span class="badge success">enabled</span>' : '<span class="badge neutral">disabled</span>'}</td>
     <td>${formatTime(key.created_at)}</td><td>${formatTime(key.last_used_at)}</td><td>${formatTime(key.expires_at)}</td>
     <td class="actions-col"><div class="row-actions">
+      <button class="button small" data-key-action="group" data-id="${key.id}">分组</button>
       <button class="button small" data-key-action="toggle" data-id="${key.id}" data-enabled="${key.enabled}">${key.enabled ? "禁用" : "启用"}</button>
       <button class="button small danger" data-key-action="delete" data-id="${key.id}">删除</button>
     </div></td>
@@ -381,6 +455,7 @@ function openUpstreamDialog(item = null) {
   $("#upstream-url").value = item?.base_url || "";
   $("#upstream-weight").value = item?.weight ?? 1;
   $("#upstream-concurrency").value = item?.max_concurrency ?? 1;
+  $("#upstream-groups").innerHTML = upstreamGroupChoices(upstreamGroupIds(item));
   $("#upstream-adapter").value = item?.adapter || "minimax-h3-native";
   $("#upstream-token").value = "";
   $("#upstream-token").placeholder = item?.has_auth_token ? "已配置；留空表示不修改" : "可选";
@@ -394,11 +469,14 @@ async function saveUpstream() {
   const id = $("#upstream-id").value;
   const token = $("#upstream-token").value;
   const conditioning = $("#upstream-conditioning").value.trim();
+  const groupIds = $$("#upstream-groups input[type='checkbox']:checked").map((item) => item.value);
   const body = {
     name: $("#upstream-name").value.trim(),
     base_url: $("#upstream-url").value.trim(),
     weight: Number($("#upstream-weight").value),
     max_concurrency: Number($("#upstream-concurrency").value),
+    group_ids: groupIds,
+    group_id: groupIds[0] || null,
     adapter: $("#upstream-adapter").value,
     enabled: $("#upstream-enabled").checked,
     options: conditioning ? { conditioning_node: conditioning } : {},
@@ -413,6 +491,52 @@ async function saveUpstream() {
     await refreshAll(false);
   } catch (error) {
     $("#upstream-error").textContent = error.message;
+  }
+}
+
+function openGroupDialog(item = null) {
+  $("#group-dialog-title").textContent = item ? "编辑分组" : "新建分组";
+  $("#group-id").value = item?.id || "";
+  $("#group-name").value = item?.name || "";
+  $("#group-enabled").checked = item?.enabled ?? true;
+  $("#group-error").textContent = "";
+  $("#group-dialog").showModal();
+}
+
+async function saveGroup() {
+  const id = $("#group-id").value;
+  const body = { name: $("#group-name").value.trim(), enabled: $("#group-enabled").checked };
+  try {
+    await api(id ? `/admin/api/upstream-groups/${id}` : "/admin/api/upstream-groups", {
+      method: id ? "PATCH" : "POST", body,
+    });
+    $("#group-dialog").close();
+    toast(id ? "分组已更新" : "分组已创建");
+    await refreshAll(false);
+  } catch (error) {
+    $("#group-error").textContent = error.message;
+  }
+}
+
+async function handleGroupAction(action, id) {
+  const item = state.groups.find((group) => group.id === id);
+  if (!item) return;
+  try {
+    if (action === "edit") {
+      openGroupDialog(item);
+      return;
+    }
+    if (action === "toggle") {
+      await api(`/admin/api/upstream-groups/${id}`, { method: "PATCH", body: { enabled: !item.enabled } });
+      toast(item.enabled ? "分组已禁用" : "分组已启用");
+    } else if (action === "delete") {
+      if (!confirm(`删除分组 ${item.name}？只能删除没有排队/运行中任务、上游和 Key 的分组。`)) return;
+      await api(`/admin/api/upstream-groups/${id}`, { method: "DELETE" });
+      toast("分组已删除");
+    }
+    await refreshAll(false);
+  } catch (error) {
+    toast(error.message, true);
   }
 }
 
@@ -503,13 +627,38 @@ async function handleAtomicAction(action) {
   }
 }
 
+function openKeyDialog(item = null) {
+  $("#key-dialog-title").textContent = item ? "编辑 API Key 分组" : "创建 API Key";
+  $("#key-id").value = item?.id || "";
+  $("#key-name").value = item?.name || "";
+  $("#key-group").innerHTML = groupOptions(item?.group_id || "");
+  $("#key-group").value = item?.group_id || "";
+  $("#key-expiry").value = "";
+  $("#key-error").textContent = "";
+  $("#key-dialog").showModal();
+}
+
 async function saveKey() {
+  const id = $("#key-id").value;
   const name = $("#key-name").value.trim();
   const expiry = $("#key-expiry").value;
   try {
+    if (id) {
+      await api(`/admin/api/api-keys/${id}`, {
+        method: "PATCH", body: { group_id: $("#key-group").value || null },
+      });
+      $("#key-dialog").close();
+      toast("API Key 分组已更新");
+      await refreshAll(false);
+      return;
+    }
     const result = await api("/admin/api/api-keys", {
       method: "POST",
-      body: { name, expires_at: expiry ? new Date(expiry).getTime() / 1000 : null },
+      body: {
+        name,
+        expires_at: expiry ? new Date(expiry).getTime() / 1000 : null,
+        group_id: $("#key-group").value || null,
+      },
     });
     $("#key-dialog").close();
     $("#new-token").textContent = result.token;
@@ -521,6 +670,11 @@ async function saveKey() {
 }
 
 async function handleKeyAction(action, id, enabled) {
+  const item = state.keys.find((key) => key.id === id);
+  if (action === "group") {
+    if (item) openKeyDialog(item);
+    return;
+  }
   try {
     if (action === "toggle") {
       await api(`/admin/api/api-keys/${id}`, { method: "PATCH", body: { enabled: !enabled } });
@@ -567,12 +721,11 @@ function bindEvents() {
 
   $$(".nav-item").forEach((item) => item.addEventListener("click", () => switchView(item.dataset.view)));
   $$('[data-go]').forEach((item) => item.addEventListener("click", () => switchView(item.dataset.go)));
+  $("#add-group").addEventListener("click", () => openGroupDialog());
+  $("#save-group").addEventListener("click", saveGroup);
   $("#add-upstream").addEventListener("click", () => openUpstreamDialog());
   $("#save-upstream").addEventListener("click", saveUpstream);
-  $("#add-key").addEventListener("click", () => {
-    $("#key-name").value = ""; $("#key-expiry").value = ""; $("#key-error").textContent = "";
-    $("#key-dialog").showModal();
-  });
+  $("#add-key").addEventListener("click", () => openKeyDialog());
   $("#save-key").addEventListener("click", saveKey);
   $("#copy-token").addEventListener("click", async () => {
     await navigator.clipboard.writeText($("#new-token").textContent);
@@ -595,6 +748,8 @@ function bindEvents() {
     if (upstreamButton) handleUpstreamAction(upstreamButton.dataset.upstreamAction, upstreamButton.dataset.id);
     const keyButton = event.target.closest("[data-key-action]");
     if (keyButton) handleKeyAction(keyButton.dataset.keyAction, keyButton.dataset.id, keyButton.dataset.enabled === "true");
+    const groupButton = event.target.closest("[data-group-action]");
+    if (groupButton) handleGroupAction(groupButton.dataset.groupAction, groupButton.dataset.id);
     const atomicButton = event.target.closest("[data-atomic-action]");
     if (atomicButton) handleAtomicAction(atomicButton.dataset.atomicAction);
   });

@@ -87,7 +87,7 @@ class FakeComfy:
         nodes = set()
         for mode in ("t2va", "i2va", "fl2va", "ref2va"):
             nodes.update(adapter.required_nodes(mode, {"conditioning_node": self.conditioning_node}))
-        nodes.update({"GetVideoComponents", "MiniMaxH3SigmaShift", "PrimitiveFloat", "ComfyMathExpression"})
+        nodes.update({"GetVideoComponents", "LoraLoaderModelOnly", "MiniMaxH3SigmaShift", "PrimitiveFloat", "ComfyMathExpression"})
         return web.json_response({node: {} for node in nodes})
 
     async def queue(self, request: web.Request) -> web.Response:
@@ -342,6 +342,128 @@ class GatewayServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["upstream_id"], accepted_config["id"])
         self.assertNotIn(job["prompt_id"], rejected.prompts)
         self.assertIn(job["prompt_id"], accepted.prompts)
+
+    async def test_group_key_dispatches_only_to_group_upstreams(self) -> None:
+        group_upstream = await self.fake()
+        other_upstream = await self.fake()
+        self.service = GatewayService(
+            settings(Path(self.tempdir.name), (group_upstream.base_url, other_upstream.base_url))
+        )
+        await self.service.start()
+        group = await self.service.create_group("GPU group A")
+        upstreams = await self.service.database.list_upstreams()
+        group_config = next(item for item in upstreams if item["base_url"] == group_upstream.base_url)
+        other_config = next(item for item in upstreams if item["base_url"] == other_upstream.base_url)
+        await self.service.update_upstream(group_config["id"], {"group_id": group["id"]})
+        key, _ = await self.service.create_api_key("group client", group_id=group["id"])
+
+        job_id = "22222222-2222-4222-8222-222222222228"
+        await self.service.submit(job_id, {"prompt": "group only"}, {}, key["id"])
+        job = await wait_status(self.service, job_id, {"succeeded"})
+        self.assertEqual(job["group_id"], group["id"])
+        self.assertEqual(job["upstream_id"], group_config["id"])
+        self.assertIn(job["prompt_id"], group_upstream.prompts)
+        self.assertNotIn(job["prompt_id"], other_upstream.prompts)
+        self.assertEqual(other_config["group_id"], None)
+
+    async def test_group_key_can_schedule_across_multiple_group_upstreams(self) -> None:
+        first = await self.fake(complete_after=1000)
+        second = await self.fake(complete_after=1000)
+        self.service = GatewayService(
+            settings(Path(self.tempdir.name), (first.base_url, second.base_url))
+        )
+        await self.service.start()
+        group = await self.service.create_group("GPU pair")
+        upstreams = await self.service.database.list_upstreams()
+        for config in upstreams:
+            await self.service.update_upstream(config["id"], {"group_id": group["id"]})
+        key, _ = await self.service.create_api_key("pair client", group_id=group["id"])
+
+        ids = [
+            "22222222-2222-4222-8222-222222222231",
+            "22222222-2222-4222-8222-222222222232",
+        ]
+        for job_id in ids:
+            await self.service.submit(job_id, {"prompt": job_id}, {}, key["id"])
+        jobs = [await wait_status(self.service, job_id, {"submitted", "running"}) for job_id in ids]
+        self.assertEqual({job["upstream_id"] for job in jobs}, {config["id"] for config in upstreams})
+
+    async def test_shared_upstream_can_serve_multiple_key_groups(self) -> None:
+        shared = await self.fake()
+        self.service = GatewayService(settings(Path(self.tempdir.name), (shared.base_url,)))
+        await self.service.start()
+        first = await self.service.create_group("GPU group A")
+        second = await self.service.create_group("GPU group B")
+        upstream = (await self.service.database.list_upstreams())[0]
+        updated = await self.service.update_upstream(
+            upstream["id"], {"group_ids": [first["id"], second["id"]]}
+        )
+        self.assertEqual(set(updated["group_ids"]), {first["id"], second["id"]})
+        first_key, _ = await self.service.create_api_key("first client", group_id=first["id"])
+        second_key, _ = await self.service.create_api_key("second client", group_id=second["id"])
+
+        first_job_id = "22222222-2222-4222-8222-222222222233"
+        second_job_id = "22222222-2222-4222-8222-222222222234"
+        await self.service.submit(first_job_id, {"prompt": "first group"}, {}, first_key["id"])
+        first_job = await wait_status(self.service, first_job_id, {"succeeded"})
+        await self.service.test_upstream(upstream["id"])
+        await self.service.submit(second_job_id, {"prompt": "second group"}, {}, second_key["id"])
+        second_job = await wait_status(self.service, second_job_id, {"succeeded"})
+        self.assertEqual(first_job["upstream_id"], upstream["id"])
+        self.assertEqual(second_job["upstream_id"], upstream["id"])
+
+        await self.service.update_group(first["id"], {"enabled": False})
+        await self.service.test_upstream(upstream["id"])
+        third_job_id = "22222222-2222-4222-8222-222222222235"
+        await self.service.submit(third_job_id, {"prompt": "second still active"}, {}, second_key["id"])
+        third_job = await wait_status(self.service, third_job_id, {"succeeded"})
+        self.assertEqual(third_job["upstream_id"], upstream["id"])
+        self.assertEqual((await self.service.health())["healthy_upstreams"], 1)
+
+        held_job_id = "22222222-2222-4222-8222-222222222236"
+        await self.service.submit(held_job_id, {"prompt": "first paused"}, {}, first_key["id"])
+        await asyncio.sleep(0.1)
+        self.assertEqual((await self.service.database.get_job(held_job_id))["status"], "queued")
+
+    async def test_group_key_does_not_fail_over_outside_its_group(self) -> None:
+        rejected = await self.fake(reject_prompts=True)
+        fallback = await self.fake()
+        self.service = GatewayService(
+            settings(Path(self.tempdir.name), (rejected.base_url, fallback.base_url))
+        )
+        await self.service.start()
+        group = await self.service.create_group("GPU group A")
+        upstreams = await self.service.database.list_upstreams()
+        group_config = next(item for item in upstreams if item["base_url"] == rejected.base_url)
+        await self.service.update_upstream(group_config["id"], {"group_id": group["id"]})
+        key, _ = await self.service.create_api_key("group client", group_id=group["id"])
+
+        job_id = "22222222-2222-4222-8222-222222222229"
+        await self.service.submit(job_id, {"prompt": "no cross group", "max_attempts": 1}, {}, key["id"])
+        job = await wait_status(self.service, job_id, {"failed"})
+        self.assertEqual(job["group_id"], group["id"])
+        self.assertFalse(fallback.prompts)
+
+    async def test_disabled_group_holds_new_jobs_until_reenabled(self) -> None:
+        upstream = await self.fake()
+        self.service = GatewayService(settings(Path(self.tempdir.name), (upstream.base_url,)))
+        await self.service.start()
+        group = await self.service.create_group("GPU group A")
+        config = (await self.service.database.list_upstreams())[0]
+        await self.service.update_upstream(config["id"], {"group_id": group["id"]})
+        await self.service.update_group(group["id"], {"enabled": False})
+        key, _ = await self.service.create_api_key("paused group client", group_id=group["id"])
+
+        job_id = "22222222-2222-4222-8222-222222222230"
+        await self.service.submit(job_id, {"prompt": "wait for group"}, {}, key["id"])
+        await asyncio.sleep(0.1)
+        self.assertEqual((await self.service.database.get_job(job_id))["status"], "queued")
+        self.assertFalse(upstream.prompts)
+        self.assertEqual((await self.service.health())["healthy_upstreams"], 0)
+
+        await self.service.update_group(group["id"], {"enabled": True})
+        completed = await wait_status(self.service, job_id, {"succeeded"})
+        self.assertEqual(completed["group_id"], group["id"])
 
     async def test_disabled_upstream_is_excluded_from_dispatch_and_health(self) -> None:
         disabled = await self.fake()

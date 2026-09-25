@@ -12,7 +12,7 @@
       v
 HTTP API ---- 管理后台
       |           |
-      +----- SQLite（任务、顺序、上游、Key、事件）
+              +----- SQLite（任务、顺序、上游、分组、Key、事件）
                     |
                     v
               中间件调度器
@@ -119,6 +119,8 @@ curl -sS http://127.0.0.1:8191/v1/generations \
 
 旧字段 `image`、`image_base64`、`image_name` 仍作为首帧接受。`POST /v1/i2va` 和 `/v1/i2va/generate` 保持可用。
 
+I2VA/FL2VA 未显式传入尺寸时默认使用 `megapixels=0.4`（16:9 输入约为 864×480），并使用 MiniMax H3 480p FL2V Turbo LoRA、8 步 Euler 采样和 `shift_video=12`、`shift_audio=3`。传入 `lora_name` 可覆盖 LoRA，传空字符串可关闭 LoRA。
+
 ### Ref2VA
 
 ```bash
@@ -146,6 +148,7 @@ JSON 调用可使用 `ref_image_names`、`ref_video_names`、`ref_video_audio_na
 - noise_seed、sampler_name、scheduler、steps、denoise
 - video_vae、audio_vae、fl2va_unet、ref2va_unet、旧别名 `unet_name`
 - weight_dtype、clip_name、clip_type、clip_device
+- lora_name、lora_strength；I2VA/FL2VA 默认使用 `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`
 - fps、bit_depth、filename_prefix、format、codec
 - ref_image_size、use_embedded_video_audio
 - shift_video、shift_audio；设置任意一个时插入 `MiniMaxH3SigmaShift`
@@ -253,6 +256,35 @@ curl -X PATCH http://127.0.0.1:8191/admin/api/upstreams/<upstream-id> \
 
 任务已经被上游接受后，如果上游不可达，状态变为 `upstream_unreachable`，不会立即复制到另一台机器，以免两个上游同时生成。上游恢复后继续对账；上游可达但 prompt 长时间既不在队列也无历史时才按 `max_attempts` 重试。模型执行错误默认终止，可通过 `H3_RETRY_EXECUTION_ERRORS=true` 改为重试。
 
+### 上游分组
+
+可以把多台 GPU 上游放入同一组，也可以让同一台上游同时加入多个组，再把一个数据库 API Key 绑定到其中一个组。绑定组后，新提交的任务会把 `group_id` 固化到任务中，只会在该组的健康成员上游之间按权重和容量调度；上传失败、提交失败和重试也不会切换到组外上游。组内队列顺序独立维护。
+
+未绑定分组的旧 API Key、`H3_API_TOKEN` bootstrap token 和管理员提交仍使用全局调度，因此升级后现有业务不需要迁移。已绑定 Key 的新任务不会使用未分组上游；组没有可用上游时任务会留在中间件队列中。
+
+管理后台的“分组”页面可以创建、启停和删除分组；在“上游”编辑框中可勾选多个分组，在“API Keys”中创建或修改 Key 的单一分组。删除分组前需要先解除它关联的上游、Key 和排队/运行中的任务；已完成的历史任务会解除组关联后保留。
+
+也可以使用管理 API：
+
+```bash
+# 创建分组
+curl -X POST http://127.0.0.1:8191/admin/api/upstream-groups \
+  -H 'Authorization: Bearer <admin-token>' -H 'Content-Type: application/json' \
+  -d '{"name":"GPU generation"}'
+
+# 将一个上游同时放入多个组
+curl -X PATCH http://127.0.0.1:8191/admin/api/upstreams/<upstream-id> \
+  -H 'Authorization: Bearer <admin-token>' -H 'Content-Type: application/json' \
+  -d '{"group_ids":["<group-id>","<shared-group-id>"]}'
+
+# 创建绑定该组的 Key
+curl -X POST http://127.0.0.1:8191/admin/api/api-keys \
+  -H 'Authorization: Bearer <admin-token>' -H 'Content-Type: application/json' \
+  -d '{"name":"GPU client","group_id":"<group-id>"}'
+```
+
+上游响应中的 `group_ids` 和 `groups` 返回全部成员关系；旧的单值 `group_id` 请求仍受支持，并会替换为单组关系。`GET /admin/api/upstream-groups` 返回组及其上游、Key 数量；`GET /admin/api/queue?group_id=<group-id>` 查看指定组的本地队列。组被禁用时，该组不会分发新任务，但共享上游仍可继续服务它加入的其他启用组；已经下发的任务仍会继续监控。
+
 ## 管理后台
 
 `/admin` 使用 `H3_ADMIN_TOKEN` 登录，提供：
@@ -260,8 +292,8 @@ curl -X PATCH http://127.0.0.1:8191/admin/api/upstreams/<upstream-id> \
 - 总任务、运行/排队任务和上游健康概览
 - 任务搜索、筛选、详情、取消、重试和置顶
 - 队列暂停、恢复、置顶、置底与取消
-- 上游增删改、权重/并发、适配器选项、健康检测，以及队列、history、中断和显存原子操作
-- API Key 创建、启停与删除
+- 上游分组的增删改、启停，以及上游增删改、权重/并发、适配器选项、健康检测，以及队列、history、中断和显存原子操作
+- API Key 创建、分组、启停与删除
 - 调度、故障转移和管理事件记录
 
 管理会话使用 `HttpOnly`、`SameSite=Strict` Cookie。跨主机部署应由 HTTPS 反向代理提供 TLS。
@@ -295,7 +327,7 @@ node --check h3_middleware/static/app.js
 h3_middleware/
   assets.py          # 本地输入文件保存与 base64 解析
   comfy_client.py    # ComfyUI 原子 HTTP 操作
-  database.py        # SQLite 队列、任务、上游、Key 与事件
+  database.py        # SQLite 队列、任务、上游、分组、Key 与事件
   service.py         # 调度、健康检查、故障转移与状态回收
   public_api.py      # 客户端 API 与旧入口
   admin_api.py       # 管理 API

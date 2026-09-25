@@ -204,6 +204,59 @@ class HttpApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(upstream["enabled"])
         self.assertTrue(upstream["runtime"]["healthy"])
 
+    async def test_admin_can_create_group_assign_upstream_and_key(self) -> None:
+        await self.client.post("/admin/api/login", json={"token": "admin"})
+        response = await self.client.post("/admin/api/upstream-groups", json={"name": "GPU group"})
+        self.assertEqual(response.status, 201)
+        group = (await response.json())["group"]
+        response = await self.client.post("/admin/api/upstream-groups", json={"name": "Shared group"})
+        self.assertEqual(response.status, 201)
+        shared_group = (await response.json())["group"]
+
+        response = await self.client.get("/admin/api/upstreams")
+        upstream_id = (await response.json())["upstreams"][0]["id"]
+        response = await self.client.patch(
+            f"/admin/api/upstreams/{upstream_id}",
+            json={"group_ids": [group["id"], shared_group["id"]]},
+        )
+        self.assertEqual(response.status, 200)
+        upstream = (await response.json())["upstream"]
+        self.assertEqual(upstream["group_id"], group["id"])
+        self.assertEqual(set(upstream["group_ids"]), {group["id"], shared_group["id"]})
+
+        response = await self.client.post(
+            "/admin/api/api-keys", json={"name": "GPU client", "group_id": group["id"]}
+        )
+        self.assertEqual(response.status, 201)
+        key_payload = await response.json()
+        self.assertEqual(key_payload["api_key"]["group_id"], group["id"])
+
+        self.client.session.cookie_jar.clear()
+        response = await self.client.post(
+            "/v1/generations",
+            json={"prompt": "grouped request"},
+            headers={"X-API-Key": key_payload["token"]},
+        )
+        self.assertEqual(response.status, 202)
+        job = (await response.json())["job"]
+        self.assertEqual(job["group_id"], group["id"])
+
+        admin_headers = {"Authorization": "Bearer admin"}
+        response = await self.client.get("/admin/api/upstream-groups", headers=admin_headers)
+        listed = (await response.json())["groups"]
+        by_id = {item["id"]: item for item in listed}
+        self.assertEqual(by_id[group["id"]]["upstream_count"], 1)
+        self.assertEqual(by_id[group["id"]]["key_count"], 1)
+        self.assertEqual(by_id[shared_group["id"]]["upstream_count"], 1)
+
+        response = await self.client.patch(
+            f"/admin/api/api-keys/{key_payload['api_key']['id']}", json={"group_id": None}, headers=admin_headers
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIsNone((await response.json())["api_key"]["group_id"])
+        response = await self.client.get(f"/v1/jobs/{job['id']}", headers={"X-API-Key": key_payload["token"]})
+        self.assertEqual((await response.json())["job"]["group_id"], group["id"])
+
     async def test_admin_exposes_comfy_atomic_controls(self) -> None:
         await self.client.post("/admin/api/login", json={"token": "admin"})
         response = await self.client.get("/admin/api/upstreams")

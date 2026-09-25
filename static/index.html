@@ -33,6 +33,7 @@
         <button class="nav-item active" data-view="overview">概览</button>
         <button class="nav-item" data-view="jobs">任务</button>
         <button class="nav-item" data-view="queue">队列</button>
+        <button class="nav-item" data-view="groups">分组</button>
         <button class="nav-item" data-view="upstreams">上游</button>
         <button class="nav-item" data-view="keys">API Keys</button>
       </nav>
@@ -121,6 +122,14 @@
         <div class="queue-list" id="queue-list"></div>
       </section>
 
+      <section class="view" id="view-groups">
+        <div class="toolbar">
+          <div><strong class="toolbar-title">上游分组</strong><span class="toolbar-copy">组内上游共享 Key 的调度队列</span></div>
+          <button class="button primary" id="add-group" type="button">新建分组</button>
+        </div>
+        <div class="group-list" id="group-list"></div>
+      </section>
+
       <section class="view" id="view-upstreams">
         <div class="toolbar">
           <div><strong class="toolbar-title">ComfyUI 上游</strong><span class="toolbar-copy">调度容量、权重与适配器</span></div>
@@ -136,7 +145,7 @@
         </div>
         <div class="table-wrap table-main">
           <table>
-            <thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>过期时间</th><th class="actions-col">操作</th></tr></thead>
+            <thead><tr><th>名称</th><th>前缀</th><th>分组</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>过期时间</th><th class="actions-col">操作</th></tr></thead>
             <tbody id="keys-body"></tbody>
           </table>
         </div>
@@ -153,6 +162,10 @@
         <label>Base URL<input id="upstream-url" type="url" placeholder="http://127.0.0.1:8188" required></label>
         <label>权重<input id="upstream-weight" type="number" min="0.01" step="0.01" value="1" required></label>
         <label>最大并发<input id="upstream-concurrency" type="number" min="1" step="1" value="1" required></label>
+        <fieldset class="wide group-picker">
+          <legend>上游分组（可多选）</legend>
+          <div class="group-check-list" id="upstream-groups"></div>
+        </fieldset>
         <label>适配器<select id="upstream-adapter"><option value="minimax-h3-native">minimax-h3-native</option></select></label>
         <label>Bearer Token<input id="upstream-token" type="password" autocomplete="new-password" placeholder="留空表示不修改"></label>
         <label class="wide">条件节点<input id="upstream-conditioning" placeholder="MiniMaxH3ImageToVideo"></label>
@@ -165,11 +178,24 @@
 
   <dialog id="key-dialog">
     <form method="dialog" id="key-form" class="dialog-form">
-      <div class="dialog-head"><h2>创建 API Key</h2><button class="icon-button" data-close="key-dialog" type="button" aria-label="关闭">&#215;</button></div>
+      <div class="dialog-head"><h2 id="key-dialog-title">创建 API Key</h2><button class="icon-button" data-close="key-dialog" type="button" aria-label="关闭">&#215;</button></div>
+      <input type="hidden" id="key-id">
       <label>名称<input id="key-name" required placeholder="Production client"></label>
+      <label>上游分组<select id="key-group"></select></label>
       <label>过期时间<input id="key-expiry" type="datetime-local"></label>
       <p class="form-error" id="key-error"></p>
       <div class="dialog-actions"><button class="button" data-close="key-dialog" type="button">取消</button><button class="button primary" id="save-key" type="button">创建</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="group-dialog">
+    <form method="dialog" id="group-form" class="dialog-form">
+      <div class="dialog-head"><h2 id="group-dialog-title">新建分组</h2><button class="icon-button" data-close="group-dialog" type="button" aria-label="关闭">&#215;</button></div>
+      <input type="hidden" id="group-id">
+      <label>名称<input id="group-name" required placeholder="GPU generation"></label>
+      <label class="check-row"><input id="group-enabled" type="checkbox" checked><span>启用该组调度</span></label>
+      <p class="form-error" id="group-error"></p>
+      <div class="dialog-actions"><button class="button" data-close="group-dialog" type="button">取消</button><button class="button primary" id="save-group" type="button">保存</button></div>
     </form>
   </dialog>
 

@@ -149,6 +149,7 @@ async def list_jobs(request: web.Request) -> web.Response:
             status=request.query.get("status"),
             mode=request.query.get("mode"),
             upstream_id=request.query.get("upstream_id"),
+            group_id=request.query.get("group_id"),
             requested_by=None if request.get(IS_ADMIN_KEY) else request.get(PRINCIPAL_KEY),
             search=request.query.get("search"),
             limit=limit,
