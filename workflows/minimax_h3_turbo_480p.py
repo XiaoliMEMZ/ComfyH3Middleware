@@ -107,4 +107,8 @@ class MiniMaxH3Turbo480pAdapter(MiniMaxH3Adapter):
         schema["description"] = "MiniMax H3 FL2VA Turbo 480p adapter with the 8-step LoRA"
         schema["parameters"]["lora_name"] = f"optional file name; defaults to {TURBO_LORA} for i2va/fl2va; empty disables"
         schema["parameters"]["lora_strength"] = 1.0
+        schema["mode_defaults"] = {
+            mode: {**copy.deepcopy(FRAME_DEFAULTS), "lora_strength": 1.0}
+            for mode in ("i2va", "fl2va")
+        }
         return schema

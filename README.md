@@ -65,6 +65,9 @@ export H3_UPSTREAMS='http://127.0.0.1:8188,http://127.0.0.1:8189'
 | `H3_API_TOKEN` | 开发凭证 | bootstrap 客户端凭证 |
 | `H3_UPSTREAMS` | `http://127.0.0.1:8188` | 首次启动时写入数据库的上游列表 |
 | `H3_DATA_DIR` | `h3_middleware/data` | SQLite 与待分发输入文件 |
+| `H3_OUTPUT_DIR` | `/data/H3Outputs` | 中间件结果文件目录 |
+| `H3_UPSTREAM_OUTPUT_DIRS` | 空 | `ComfyUI URL=本地 output 目录`，用分号分隔；配置后复制成功才会删除 ComfyUI 源文件 |
+| `H3_OUTPUT_SYNC_INTERVAL` | `5` | 结果迁移与源文件清理间隔（秒） |
 | `H3_MAX_ATTEMPTS` | `2` | 默认调度尝试次数 |
 | `H3_HEALTH_INTERVAL` | `5` | 上游健康检查秒数 |
 | `H3_POLL_INTERVAL` | `1` | 任务历史轮询秒数 |
@@ -111,6 +114,7 @@ curl -sS http://127.0.0.1:8191/v1/generations \
 curl -sS http://127.0.0.1:8191/v1/generations \
   -H 'Authorization: Bearer <token>' \
   -F 'mode=fl2va' \
+  -F 'adapter=minimax-h3-fl2va-turbo-480p' \
   -F 'first_frame=@/path/first.png' \
   -F 'last_frame=@/path/last.png' \
   -F 'prompt=Move smoothly from the first frame to the last frame' \
@@ -119,7 +123,9 @@ curl -sS http://127.0.0.1:8191/v1/generations \
 
 旧字段 `image`、`image_base64`、`image_name` 仍作为首帧接受。`POST /v1/i2va` 和 `/v1/i2va/generate` 保持可用。
 
-I2VA/FL2VA 未显式传入尺寸时默认使用 `megapixels=0.4`（16:9 输入约为 864×480），并使用 MiniMax H3 480p FL2V Turbo LoRA、8 步 Euler 采样和 `shift_video=12`、`shift_audio=3`。传入 `lora_name` 可覆盖 LoRA，传空字符串可关闭 LoRA。
+生成完成后，中间件会先将每个结果原子复制到 `H3_OUTPUT_DIR/<job-id>/`，下载接口直接读取该副本。配置 `H3_UPSTREAM_OUTPUT_DIRS` 后，副本校验成功才会删除对应的 ComfyUI 输出文件；服务启动后的后台同步会继续迁移历史任务和此前复制失败的结果。未配置本地源目录时仍可通过 ComfyUI `/view` 读取结果，但中间件不会删除上游文件。
+
+默认适配器 `minimax-h3-native` 保持原来的 20 步流水线。使用 `adapter=minimax-h3-fl2va-turbo-480p` 时，I2VA/FL2VA 未显式传入尺寸会使用 `megapixels=0.4`（16:9 输入约为 864×480），并使用 MiniMax H3 480p FL2V Turbo LoRA、8 步 Euler 采样和 `shift_video=12`、`shift_audio=3`。传入 `lora_name` 可覆盖 LoRA，传空字符串可关闭 LoRA。
 
 ### Ref2VA
 
@@ -143,12 +149,13 @@ JSON 调用可使用 `ref_image_names`、`ref_video_names`、`ref_video_audio_na
 
 内置适配器控制以下工作流参数：
 
+- `adapter`：`minimax-h3-native`（老流水线）或 `minimax-h3-fl2va-turbo-480p`（480p 8 步 LoRA 流水线）
 - prompt、duration、length、可选 `length_expression`
 - width、height，或 I2VA/FL2VA 的 megapixels、upscale_method、resolution_steps
 - noise_seed、sampler_name、scheduler、steps、denoise
 - video_vae、audio_vae、fl2va_unet、ref2va_unet、旧别名 `unet_name`
 - weight_dtype、clip_name、clip_type、clip_device
-- lora_name、lora_strength；I2VA/FL2VA 默认使用 `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`
+- `lora_name`、`lora_strength`；仅 `minimax-h3-fl2va-turbo-480p` 默认使用 `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`
 - fps、bit_depth、filename_prefix、format、codec
 - ref_image_size、use_embedded_video_audio
 - shift_video、shift_audio；设置任意一个时插入 `MiniMaxH3SigmaShift`
@@ -326,6 +333,7 @@ node --check h3_middleware/static/app.js
 ```text
 h3_middleware/
   assets.py          # 本地输入文件保存与 base64 解析
+  output_store.py    # 结果原子落盘、校验与安全读取
   comfy_client.py    # ComfyUI 原子 HTTP 操作
   database.py        # SQLite 队列、任务、上游、分组、Key 与事件
   service.py         # 调度、健康检查、故障转移与状态回收
