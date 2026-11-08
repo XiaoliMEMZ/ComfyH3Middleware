@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import sqlite3
 import time
 import uuid
+from pathlib import Path, PurePath
 from typing import Any
 from urllib.parse import urlparse
 
@@ -22,6 +24,7 @@ from .comfy_client import (
 )
 from .config import Settings
 from .database import ACTIVE_STATUSES, LOCAL_QUEUE_STATUSES, TERMINAL_STATUSES, Database
+from .output_store import OutputStore
 from .progress import apply_progress_event, create_progress, event_prompt_id, present_progress
 from .upstreams import UpstreamManager
 from .workflows import AdapterRegistry, create_registry
@@ -35,6 +38,7 @@ class GatewayService:
         self.settings = settings
         self.database = Database(settings.database_path)
         self.assets = AssetStore(settings.asset_dir, settings.max_upload_bytes)
+        self.output_store = OutputStore(settings.output_dir or settings.data_dir / "outputs")
         self.registry = registry or create_registry(settings.conditioning_node)
         self.session: aiohttp.ClientSession | None = None
         self.upstreams: UpstreamManager | None = None
@@ -42,11 +46,13 @@ class GatewayService:
         self.progress_listeners: dict[str, asyncio.Task[Any]] = {}
         self.progress_listener_configs: dict[str, tuple[str, str | None]] = {}
         self.wake_scheduler = asyncio.Event()
+        self.output_sync_lock = asyncio.Lock()
         self.stopping = False
 
     async def start(self) -> None:
         self.stopping = False
         self.settings.prepare()
+        self.output_store.prepare()
         await self.database.initialize()
         await self.database.seed_upstreams(self.settings.initial_upstreams)
         timeout = aiohttp.ClientTimeout(
@@ -63,6 +69,7 @@ class GatewayService:
             asyncio.create_task(self._scheduler_loop(), name="h3-scheduler"),
             asyncio.create_task(self._monitor_loop(), name="h3-monitor"),
             asyncio.create_task(self._health_loop(), name="h3-health"),
+            asyncio.create_task(self._output_reconciliation_loop(), name="h3-output-reconciliation"),
         ]
 
     async def stop(self) -> None:
@@ -137,6 +144,7 @@ class GatewayService:
         item = dict(job)
         item["progress"] = present_progress(item.get("progress"), item["status"], item.get("updated_at"))
         stored_assets = item.pop("assets", {})
+        item.pop("output_storage_complete", None)
         item["inputs"] = {
             kind: [
                 {
@@ -149,6 +157,8 @@ class GatewayService:
             for kind, values in stored_assets.items()
         }
         for index, output in enumerate(item.get("outputs") or []):
+            output.pop("path", None)
+            output.pop("source_cleaned", None)
             output["download_url"] = f"/v1/jobs/{item['id']}/outputs/{index}"
         videos = [output for output in item.get("outputs") or [] if output.get("kind") == "video"]
         if videos:
@@ -253,11 +263,18 @@ class GatewayService:
         outputs = job.get("outputs") or []
         if index < 0 or index >= len(outputs):
             raise ValueError("output not found")
+        output = outputs[index]
+        if self.output_store.is_local(output):
+            try:
+                data, content_type = self.output_store.read(output)
+                return data, content_type, output["filename"]
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                LOGGER.warning("Local output for job %s is unavailable: %s", job_id, exc)
         upstream = await self.database.get_upstream(job.get("upstream_id")) if job.get("upstream_id") else None
         if not upstream:
             raise ValueError("job has no output upstream")
-        data, content_type = await self._client(upstream).view(outputs[index])
-        return data, content_type, outputs[index]["filename"]
+        data, content_type = await self._client(upstream).view(output)
+        return data, content_type, output["filename"]
 
     async def get_video(self, job_id: str) -> tuple[bytes, str, str]:
         job = await self.database.get_job(job_id)
@@ -877,18 +894,40 @@ class GatewayService:
                         await self.database.add_event("job.failed", "job", job["id"], error["message"], error)
                 else:
                     outputs = extract_outputs(history)
+                    async with self.output_sync_lock:
+                        stored_outputs, storage_complete = await self._materialize_outputs(job, upstream, outputs)
                     await self.database.update_job(
                         job["id"],
                         status="succeeded",
-                        outputs=outputs,
+                        outputs=stored_outputs,
+                        output_storage_complete=False,
                         error=None,
                         finished_at=time.time(),
                     )
+                    cleanup_complete = False
+                    if storage_complete:
+                        async with self.output_sync_lock:
+                            stored_outputs, cleanup_complete = await self._cleanup_materialized_outputs(
+                                upstream,
+                                stored_outputs,
+                            )
+                        await self.database.update_job(
+                            job["id"],
+                            outputs=stored_outputs,
+                            output_storage_complete=cleanup_complete,
+                        )
+                    if not storage_complete or not cleanup_complete:
+                        await self.database.add_event(
+                            "job.output_pending",
+                            "job",
+                            job["id"],
+                            "Output is available upstream and will be copied to middleware storage",
+                        )
                     await self.database.add_event(
                         "job.succeeded",
                         "job",
                         job["id"],
-                        f"Generation completed with {len(outputs)} output(s)",
+                        f"Generation completed with {len(stored_outputs)} output(s)",
                     )
                 continue
             if prompt_id in running:
@@ -914,6 +953,187 @@ class GatewayService:
             except Exception:
                 LOGGER.exception("progress listener supervisor failed")
             await asyncio.sleep(max(1.0, self.settings.poll_interval))
+
+    async def _output_reconciliation_loop(self) -> None:
+        while not self.stopping:
+            try:
+                jobs = await self.database.completed_jobs_with_outputs(limit=100)
+                for job in jobs:
+                    if self.stopping:
+                        return
+                    if not self._needs_output_reconciliation(job["outputs"]):
+                        await self.database.update_job(job["id"], output_storage_complete=True)
+                        continue
+                    upstream = await self.database.get_upstream(job.get("upstream_id")) if job.get("upstream_id") else None
+                    async with self.output_sync_lock:
+                        current = await self.database.get_job(job["id"])
+                        if not current or current["status"] != "succeeded":
+                            continue
+                        outputs, storage_complete = await self._materialize_outputs(
+                            current,
+                            upstream,
+                            current.get("outputs") or [],
+                        )
+                        if outputs != current.get("outputs"):
+                            await self.database.update_job(job["id"], outputs=outputs)
+                        cleanup_complete = False
+                        if storage_complete:
+                            outputs, cleanup_complete = await self._cleanup_materialized_outputs(
+                                upstream,
+                                outputs,
+                            )
+                            if outputs != current.get("outputs") or cleanup_complete != current.get("output_storage_complete"):
+                                await self.database.update_job(
+                                    job["id"],
+                                    outputs=outputs,
+                                    output_storage_complete=cleanup_complete,
+                                )
+                        elif outputs != current.get("outputs"):
+                            await self.database.update_job(
+                                job["id"],
+                                outputs=outputs,
+                                output_storage_complete=False,
+                            )
+                        if storage_complete and cleanup_complete:
+                            await self.database.add_event(
+                                "job.output_stored",
+                                "job",
+                                job["id"],
+                                "Copied output to middleware storage",
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("output reconciliation failed")
+            await asyncio.sleep(max(1.0, self.settings.output_sync_interval))
+
+    def _needs_output_reconciliation(self, outputs: list[dict[str, Any]]) -> bool:
+        return any(
+            not self.output_store.is_local(output) or not output.get("source_cleaned")
+            for output in outputs
+        )
+
+    async def _materialize_outputs(
+        self,
+        job: dict[str, Any],
+        upstream: dict[str, Any] | None,
+        outputs: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        materialized: list[dict[str, Any]] = []
+        complete = True
+        client = self._client(upstream) if upstream else None
+        for index, output in enumerate(outputs):
+            current = dict(output)
+            output_content_type = str(
+                current.get("content_type")
+                or mimetypes.guess_type(str(current.get("filename") or ""))[0]
+                or "application/octet-stream"
+            )
+            local_ready = self.output_store.is_local(current)
+            if local_ready:
+                try:
+                    await asyncio.to_thread(self.output_store.stored_path, current)
+                except (FileNotFoundError, OSError, ValueError):
+                    local_ready = False
+                    for key in ("storage", "path", "size", "sha256", "content_type", "source_cleaned"):
+                        current.pop(key, None)
+
+            if not local_ready:
+                source = self._source_path(upstream, current)
+                try:
+                    if source is not None and source.is_file():
+                        local = await asyncio.to_thread(
+                            self.output_store.store_path,
+                            job["id"],
+                            index,
+                            str(current.get("filename") or f"output_{index}.bin"),
+                            source,
+                            output_content_type,
+                        )
+                    else:
+                        if client is None:
+                            raise ValueError("output upstream is unavailable")
+                        data, content_type = await client.view(current)
+                        local = await asyncio.to_thread(
+                            self.output_store.store_bytes,
+                            job["id"],
+                            index,
+                            str(current.get("filename") or f"output_{index}.bin"),
+                            data,
+                            content_type,
+                        )
+                    current.update(local)
+                except (ComfyError, OSError, ValueError, RuntimeError) as exc:
+                    complete = False
+                    LOGGER.warning("Could not store output %s for job %s: %s", index, job["id"], exc)
+                    materialized.append(current)
+                    continue
+
+            materialized.append(current)
+        return materialized, complete
+
+    async def _cleanup_materialized_outputs(
+        self,
+        upstream: dict[str, Any] | None,
+        outputs: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        cleaned: list[dict[str, Any]] = []
+        complete = True
+        for output in outputs:
+            current = dict(output)
+            if not self.output_store.is_local(current):
+                complete = False
+            elif current.get("source_cleaned") is not True:
+                current["source_cleaned"] = await asyncio.to_thread(self._cleanup_source, upstream, current)
+                if current["source_cleaned"] is not True:
+                    complete = False
+            cleaned.append(current)
+        return cleaned, complete
+
+    def _source_path(self, upstream: dict[str, Any] | None, output: dict[str, Any]) -> Path | None:
+        source_roots = self._source_roots(upstream.get("base_url") if upstream else None)
+        if not source_roots:
+            return None
+        subfolder = str(output.get("subfolder") or "")
+        filename = str(output.get("filename") or "")
+        if not filename or output.get("type", "output") != "output":
+            return None
+        relative = PurePath(subfolder, filename)
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        for source_root in source_roots:
+            path = (source_root / relative).resolve()
+            try:
+                path.relative_to(source_root)
+            except ValueError:
+                continue
+            if path.is_file() or len(source_roots) == 1:
+                return path
+        return None
+
+    def _cleanup_source(self, upstream: dict[str, Any] | None, output: dict[str, Any]) -> bool:
+        source = self._source_path(upstream, output)
+        if source is None:
+            return False
+        try:
+            source.unlink(missing_ok=True)
+            return True
+        except OSError as exc:
+            LOGGER.warning("Could not remove ComfyUI output %s: %s", source, exc)
+            return False
+
+    def _source_roots(self, base_url: str | None) -> tuple[Path, ...]:
+        configured = self.settings.upstream_output_dirs
+        if base_url:
+            normalized = str(base_url).rstrip("/")
+            matched = tuple(
+                directory
+                for configured_url, directory in configured
+                if configured_url.rstrip("/") == normalized
+            )
+            if matched:
+                return matched
+        return tuple(directory for _, directory in configured)
 
     async def _sync_progress_listeners(self) -> None:
         upstreams = await self.database.list_upstreams()

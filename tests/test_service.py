@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -267,10 +268,38 @@ class GatewayServiceTests(unittest.IsolatedAsyncioTestCase):
         job = await wait_status(self.service, job_id, {"succeeded"})
         self.assertEqual(job["upstream_id"], (await self.service.database.list_upstreams())[0]["id"])
         self.assertEqual(job["outputs"][0]["kind"], "video")
+        self.assertEqual(job["outputs"][0]["storage"], "local")
+        self.assertTrue((Path(self.tempdir.name) / "outputs" / job_id).is_dir())
         data, content_type, filename = await self.service.get_video(job_id)
         self.assertEqual(data, b"video-data")
         self.assertEqual(content_type, "video/mp4")
         self.assertTrue(filename.endswith(".mp4"))
+
+    async def test_output_is_stored_before_comfy_source_cleanup(self) -> None:
+        upstream = await self.fake(complete_after=4)
+        source_root = Path(self.tempdir.name) / "comfy-output"
+        (source_root / "video").mkdir(parents=True)
+        config = replace(
+            settings(Path(self.tempdir.name), (upstream.base_url,)),
+            upstream_output_dirs=((upstream.base_url, source_root),),
+        )
+        self.service = GatewayService(config)
+        await self.service.start()
+        job_id = "11111111-1111-4111-8111-111111111113"
+        await self.service.submit(job_id, {"prompt": "clouds"}, {}, "test")
+        submitted = await wait_status(self.service, job_id, {"submitted", "running"})
+        source = source_root / "video" / f"{submitted['prompt_id']}.mp4"
+        source.write_bytes(b"source-video")
+
+        job = await wait_status(self.service, job_id, {"succeeded"})
+        output = job["outputs"][0]
+        self.assertEqual(output["storage"], "local")
+        self.assertTrue(output["source_cleaned"])
+        self.assertTrue(job["output_storage_complete"])
+        self.assertFalse(source.exists())
+        data, content_type, _ = await self.service.get_video(job_id)
+        self.assertEqual(data, b"source-video")
+        self.assertEqual(content_type, "video/mp4")
 
     async def test_websocket_reports_node_step_phase_and_eta(self) -> None:
         upstream = await self.fake(complete_after=1000)

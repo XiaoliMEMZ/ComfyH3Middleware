@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -10,6 +11,23 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_upstream_output_dirs(value: str) -> tuple[tuple[str, Path], ...]:
+    """Parse ``base_url=/local/output`` pairs used for safe source cleanup."""
+    result: list[tuple[str, Path]] = []
+    for entry in value.split(";"):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        base_url, directory = entry.split("=", 1)
+        base_url = base_url.strip().rstrip("/")
+        parsed = urlparse(base_url)
+        directory = directory.strip()
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not directory:
+            continue
+        result.append((base_url, Path(directory).expanduser().resolve()))
+    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -33,6 +51,9 @@ class Settings:
     default_max_attempts: int
     conditioning_node: str
     retry_execution_errors: bool
+    output_dir: Path | None = None
+    upstream_output_dirs: tuple[tuple[str, Path], ...] = ()
+    output_sync_interval: float = 5.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -63,9 +84,16 @@ class Settings:
             default_max_attempts=max(1, int(os.environ.get("H3_MAX_ATTEMPTS", "2"))),
             conditioning_node=os.environ.get("H3_CONDITIONING_NODE", "MiniMaxH3ImageToVideo"),
             retry_execution_errors=_env_bool("H3_RETRY_EXECUTION_ERRORS", False),
+            output_dir=Path(os.environ.get("H3_OUTPUT_DIR", "/data/H3Outputs")).expanduser().resolve(),
+            upstream_output_dirs=_parse_upstream_output_dirs(
+                os.environ.get("H3_UPSTREAM_OUTPUT_DIRS", "")
+            ),
+            output_sync_interval=max(1.0, float(os.environ.get("H3_OUTPUT_SYNC_INTERVAL", "5"))),
         )
 
     def prepare(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.asset_dir.mkdir(parents=True, exist_ok=True)
+        if self.output_dir is not None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)

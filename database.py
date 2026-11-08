@@ -134,6 +134,7 @@ class Database:
                 params_json TEXT NOT NULL,
                 assets_json TEXT NOT NULL,
                 outputs_json TEXT NOT NULL DEFAULT '[]',
+                output_storage_complete INTEGER NOT NULL DEFAULT 0,
                 error_json TEXT,
                 progress_json TEXT NOT NULL DEFAULT '{}',
                 group_id TEXT,
@@ -181,6 +182,7 @@ class Database:
             ("api_keys", "group_id", "TEXT REFERENCES upstream_groups(id) ON DELETE SET NULL"),
             ("jobs", "progress_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("jobs", "group_id", "TEXT REFERENCES upstream_groups(id) ON DELETE SET NULL"),
+            ("jobs", "output_storage_complete", "INTEGER NOT NULL DEFAULT 0"),
         )
         for table, column, definition in migrations:
             columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
@@ -289,7 +291,14 @@ class Database:
                 (group_id, group_id, group_id, *LOCAL_QUEUE_STATUSES, *ACTIVE_STATUSES),
             ).fetchone()
             if any(assignments):
-                raise ValueError("group still has assigned upstreams, API keys, or active jobs")
+                blockers = []
+                if assignments["upstreams"]:
+                    blockers.append(f"assigned upstreams ({assignments['upstreams']})")
+                if assignments["api_keys"]:
+                    blockers.append(f"API keys ({assignments['api_keys']})")
+                if assignments["jobs"]:
+                    blockers.append(f"active jobs ({assignments['jobs']})")
+                raise ValueError("group still has " + ", ".join(blockers))
             self.conn.execute("UPDATE jobs SET group_id=NULL WHERE group_id=?", (group_id,))
             cursor = self.conn.execute("DELETE FROM upstream_groups WHERE id=?", (group_id,))
             self.conn.commit()
@@ -694,6 +703,19 @@ class Database:
             ).fetchall()
         return [self._job(row) for row in rows]
 
+    async def completed_jobs_with_outputs(self, limit: int = 100) -> list[dict[str, Any]]:
+        async with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status='succeeded' AND outputs_json <> '[]' AND output_storage_complete=0
+                ORDER BY COALESCE(finished_at, updated_at), created_at
+                LIMIT ?
+                """,
+                (min(max(limit, 1), 500),),
+            ).fetchall()
+        return [self._job(row) for row in rows]
+
     async def active_counts(self) -> dict[str, int]:
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         async with self.lock:
@@ -739,6 +761,7 @@ class Database:
             "prompt_id",
             "attempts",
             "max_attempts",
+            "output_storage_complete",
             "not_before",
             "cancel_requested",
             "submitted_at",
@@ -890,6 +913,7 @@ class Database:
                 """
                 UPDATE jobs SET status='queued', queue_order=?, upstream_id=NULL, prompt_id=NULL,
                     attempts=0, not_before=0, cancel_requested=0, outputs_json='[]', error_json=NULL, progress_json='{}',
+                    output_storage_complete=0,
                     submitted_at=NULL, started_at=NULL, finished_at=NULL, updated_at=?
                 WHERE id=?
                 """,
@@ -994,4 +1018,5 @@ class Database:
             default: Any = [] if key == "outputs" else {} if key in {"params", "assets", "progress"} else None
             item[key] = _decode_json(item.pop(column), default)
         item["cancel_requested"] = bool(item["cancel_requested"])
+        item["output_storage_complete"] = bool(item["output_storage_complete"])
         return item

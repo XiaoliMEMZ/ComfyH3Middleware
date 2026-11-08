@@ -87,7 +87,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "same queue group"):
             await self.database.reorder_job("job-b", "before", "job-c")
 
-        with self.assertRaisesRegex(ValueError, "assigned upstreams"):
+        with self.assertRaisesRegex(ValueError, r"assigned upstreams \(1\).*API keys \(1\)"):
             await self.database.delete_group(first["id"])
         await self.database.set_api_key_group(key["id"], None)
         updated = await self.database.update_upstream(upstream["id"], {"group_ids": [second["id"]]})
