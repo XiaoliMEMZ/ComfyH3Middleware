@@ -456,7 +456,6 @@ function openUpstreamDialog(item = null) {
   $("#upstream-weight").value = item?.weight ?? 1;
   $("#upstream-concurrency").value = item?.max_concurrency ?? 1;
   $("#upstream-groups").innerHTML = upstreamGroupChoices(upstreamGroupIds(item));
-  $("#upstream-adapter").value = item?.adapter || "minimax-h3-native";
   $("#upstream-token").value = "";
   $("#upstream-token").placeholder = item?.has_auth_token ? "已配置；留空表示不修改" : "可选";
   $("#upstream-conditioning").value = item?.options?.conditioning_node || "";
@@ -477,7 +476,6 @@ async function saveUpstream() {
     max_concurrency: Number($("#upstream-concurrency").value),
     group_ids: groupIds,
     group_id: groupIds[0] || null,
-    adapter: $("#upstream-adapter").value,
     enabled: $("#upstream-enabled").checked,
     options: conditioning ? { conditioning_node: conditioning } : {},
   };

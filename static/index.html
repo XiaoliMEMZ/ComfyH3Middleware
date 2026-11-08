@@ -132,7 +132,7 @@
 
       <section class="view" id="view-upstreams">
         <div class="toolbar">
-          <div><strong class="toolbar-title">ComfyUI 上游</strong><span class="toolbar-copy">调度容量、权重与适配器</span></div>
+          <div><strong class="toolbar-title">ComfyUI 上游</strong><span class="toolbar-copy">调度容量与权重；工作流由请求的 adapter 决定</span></div>
           <button class="button primary" id="add-upstream" type="button">添加上游</button>
         </div>
         <div class="upstream-list" id="upstream-list"></div>
@@ -166,7 +166,6 @@
           <legend>上游分组（可多选）</legend>
           <div class="group-check-list" id="upstream-groups"></div>
         </fieldset>
-        <label>适配器<select id="upstream-adapter"><option value="minimax-h3-native">minimax-h3-native</option></select></label>
         <label>Bearer Token<input id="upstream-token" type="password" autocomplete="new-password" placeholder="留空表示不修改"></label>
         <label class="wide">条件节点<input id="upstream-conditioning" placeholder="MiniMaxH3ImageToVideo"></label>
         <label class="check-row wide"><input id="upstream-enabled" type="checkbox" checked><span>启用调度</span></label>

@@ -454,6 +454,31 @@ class GatewayServiceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.1)
         self.assertEqual((await self.service.database.get_job(held_job_id))["status"], "queued")
 
+    async def test_request_adapter_runs_on_any_upstream(self) -> None:
+        shared = await self.fake()
+        self.service = GatewayService(settings(Path(self.tempdir.name), (shared.base_url,)))
+        await self.service.start()
+        native_group = await self.service.create_group("native clients")
+        turbo_group = await self.service.create_group("turbo clients")
+        upstream = (await self.service.database.list_upstreams())[0]
+        turbo = "minimax-h3-fl2va-turbo-480p"
+        # The upstream's legacy adapter field no longer filters jobs.
+        await self.service.update_upstream(
+            upstream["id"], {"adapter": turbo, "group_ids": [native_group["id"], turbo_group["id"]]}
+        )
+        native_key, _ = await self.service.create_api_key("native client", group_id=native_group["id"])
+        turbo_key, _ = await self.service.create_api_key("turbo client", group_id=turbo_group["id"])
+
+        native_job_id = "22222222-2222-4222-8222-222222222240"
+        await self.service.submit(native_job_id, {"prompt": "no adapter in the request"}, {}, native_key["id"])
+        native_job = await wait_status(self.service, native_job_id, {"succeeded"})
+        self.assertEqual((native_job["adapter"], native_job["upstream_id"]), ("minimax-h3-native", upstream["id"]))
+        await self.service.test_upstream(upstream["id"])
+        turbo_job_id = "22222222-2222-4222-8222-222222222241"
+        await self.service.submit(turbo_job_id, {"prompt": "turbo request", "adapter": turbo}, {}, turbo_key["id"])
+        turbo_job = await wait_status(self.service, turbo_job_id, {"succeeded"})
+        self.assertEqual((turbo_job["adapter"], turbo_job["upstream_id"]), (turbo, upstream["id"]))
+
     async def test_group_key_does_not_fail_over_outside_its_group(self) -> None:
         rejected = await self.fake(reject_prompts=True)
         fallback = await self.fake()
@@ -506,9 +531,7 @@ class GatewayServiceTests(unittest.IsolatedAsyncioTestCase):
             item["id"]: MiniMaxH3Adapter().required_nodes("t2va")
             for item in upstreams
         }
-        stale_candidates = await self.service._manager().candidates(
-            "minimax-h3-native", required, active_counts={}
-        )
+        stale_candidates = await self.service._manager().candidates(required, active_counts={})
         self.assertEqual(stale_candidates[0]["id"], disabled_config["id"])
         await self.service.set_queue_paused(True)
 
@@ -588,9 +611,7 @@ class GatewayServiceTests(unittest.IsolatedAsyncioTestCase):
         }
         selected = {high["id"]: 0, low["id"]: 0}
         for _ in range(8):
-            candidates = await self.service._manager().candidates(
-                "minimax-h3-native", required, active_counts={}
-            )
+            candidates = await self.service._manager().candidates(required, active_counts={})
             upstream_id = candidates[0]["id"]
             selected[upstream_id] += 1
             self.service._manager().selected(upstream_id)

@@ -651,11 +651,8 @@ class GatewayService:
                         assets=job["assets"],
                     )
                     for upstream in upstream_configs
-                    if upstream["adapter"] == job["adapter"]
                 }
-                candidates = await self._manager().candidates(
-                    job["adapter"], required, active_counts, group_id=job.get("group_id")
-                )
+                candidates = await self._manager().candidates(required, active_counts, group_id=job.get("group_id"))
                 if not candidates:
                     continue
                 claimed = await self.database.claim_job(job["id"])

@@ -88,19 +88,18 @@ class UpstreamManager:
 
     async def candidates(
         self,
-        adapter_name: str,
         required_nodes: dict[str, set[str]],
         active_counts: dict[str, int],
         exclude: set[str] | None = None,
         group_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Upstreams that can take a job now; the job's own adapter builds the workflow on any of them."""
+
         exclude = exclude or set()
         upstreams = await self.database.list_upstreams(enabled_only=True)
         ranked: list[tuple[float, float, dict[str, Any]]] = []
         for upstream in upstreams:
             if upstream["id"] in exclude:
-                continue
-            if upstream["adapter"] != adapter_name:
                 continue
             groups = {group["id"]: group for group in upstream.get("groups", [])}
             if group_id is not None:
