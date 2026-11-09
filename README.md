@@ -239,7 +239,12 @@ curl -H 'Authorization: Bearer <token>' \
 
 curl -H 'Authorization: Bearer <token>' \
   http://127.0.0.1:8191/v1/jobs/<job-id>/video -o output.mp4
+
+curl -H 'Authorization: Bearer <token>' \
+  http://127.0.0.1:8191/v1/jobs/<job-id>/inputs/first_frame/0 -o first.png
 ```
+
+任务响应 `inputs` 中的每个上传文件都带 `download_url`（`/v1/jobs/<job-id>/inputs/<kind>/<index>`），可取回提交时上传的原文件，`kind` 为 `first_frame`、`last_frame`、`ref_images`、`ref_videos`、`ref_video_audios` 或 `ref_audios`。与结果下载一样，只有提交任务的 Key 和管理员可以访问。
 
 本地排队任务直接转为 `canceled`。已下发任务优先调用 ComfyUI 的原子 `POST /api/jobs/{prompt_id}/cancel`；旧上游回退到 queue 快照、pending delete 和定向 interrupt。
 

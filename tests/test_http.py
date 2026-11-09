@@ -147,6 +147,32 @@ class HttpApiTests(unittest.IsolatedAsyncioTestCase):
         payload = await response.json()
         self.assertEqual(payload["job"]["mode"], "i2va")
 
+    async def test_input_download_returns_original_upload(self) -> None:
+        headers = {"Authorization": "Bearer api"}
+        form = aiohttp.FormData()
+        form.add_field("prompt", "move")
+        form.add_field("first_frame", b"fake-png", filename="first.png", content_type="image/png")
+        response = await self.client.post("/v1/generations", data=form, headers=headers)
+        self.assertEqual(response.status, 202)
+        job = (await response.json())["job"]
+        url = job["inputs"]["first_frame"][0]["download_url"]
+        self.assertEqual(url, f"/v1/jobs/{job['id']}/inputs/first_frame/0")
+
+        response = await self.client.get(url, headers=headers)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), b"fake-png")
+        self.assertEqual(response.content_type, "image/png")
+        self.assertEqual(response.headers["Content-Disposition"], 'attachment; filename="first.png"')
+
+        response = await self.client.get(f"/v1/jobs/{job['id']}/inputs/first_frame/1", headers=headers)
+        self.assertEqual(response.status, 400)
+
+        response = await self.client.post(
+            "/admin/api/api-keys", json={"name": "other"}, headers={"Authorization": "Bearer admin"}
+        )
+        response = await self.client.get(url, headers={"X-API-Key": (await response.json())["token"]})
+        self.assertEqual(response.status, 404)
+
     async def test_invalid_sync_timeout_does_not_create_a_job(self) -> None:
         headers = {"Authorization": "Bearer api"}
         response = await self.client.post(

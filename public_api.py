@@ -270,3 +270,21 @@ async def get_output(request: web.Request) -> web.Response:
 @routes.get("/v1/jobs/{job_id}/video")
 async def get_video(request: web.Request) -> web.Response:
     return await _output_response(request, video_only=True)
+
+
+@routes.get("/v1/jobs/{job_id}/inputs/{kind}/{index}")
+async def get_input(request: web.Request) -> web.StreamResponse:
+    gateway = service(request)
+    job = await gateway.get_job(request.match_info["job_id"])
+    if not job or not can_access(request, job):
+        return json_error("Job not found", status=404)
+    try:
+        path, content_type, filename = await gateway.get_input(
+            job["id"], request.match_info["kind"], int(request.match_info["index"])
+        )
+    except Exception as exc:
+        return exception_response(exc)
+    return web.FileResponse(
+        path,
+        headers={"Content-Type": content_type, "Content-Disposition": f'attachment; filename="{filename}"'},
+    )

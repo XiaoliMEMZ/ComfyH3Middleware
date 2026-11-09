@@ -151,8 +151,9 @@ class GatewayService:
                     "filename": asset.get("filename"),
                     "size": asset.get("size"),
                     "content_type": asset.get("content_type"),
+                    "download_url": f"/v1/jobs/{item['id']}/inputs/{kind}/{index}",
                 }
-                for asset in values
+                for index, asset in enumerate(values)
             ]
             for kind, values in stored_assets.items()
         }
@@ -284,6 +285,16 @@ class GatewayService:
             if output.get("kind") == "video":
                 return await self.get_output(job_id, index)
         raise ValueError("video is not ready")
+
+    async def get_input(self, job_id: str, kind: str, index: int) -> tuple[Path, str, str]:
+        job = await self.database.get_job(job_id)
+        if not job:
+            raise ValueError("job not found")
+        inputs = job["assets"].get(kind) or []
+        if index < 0 or index >= len(inputs):
+            raise ValueError("input not found")
+        asset = inputs[index]
+        return Path(asset["path"]), asset["content_type"], asset["filename"]
 
     async def health(self) -> dict[str, Any]:
         upstreams = await self.list_upstreams(public=True)
